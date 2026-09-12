@@ -6,7 +6,7 @@ The complete demo CI matrix runs on API 21 and API 34. Minimum-API framework
 and consumer checks are separate; they do not establish coverage for every
 intermediate API level.
 
-## KSP2 route/provider development milestone
+## KSP2 compiler development checks
 
 The independent [KSP compiler](../arouter-compiler-ksp/README.md) and
 [Android fixture](ksp-fixture) use JDK 17, Gradle 9.5.0, KSP 2.3.12,
@@ -23,18 +23,19 @@ AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
 ```
 
 The last command requires exactly one booted emulator; CI uses API 34.
-It exercises mixed APT/KSP module registration, actual Java/Kotlin Activity
-navigation, Fragment arguments and provider lookup in Debug and Release/R8.
+It exercises mixed KAPT/KSP module registration, actual Java/Kotlin Activity
+navigation, field injection, inherited/nested helpers, generic serialization,
+Fragment arguments, provider lookup and interception in Debug and Release/R8.
 The fixture has no test-only keep rules. The verifier also checks configuration
 cache reuse, incremental route changes and compiler/runtime dependency isolation.
 It preserves isolated fixture copies, logs, fresh device reports and R8 mappings
 under `build/reports/ksp-consumer`; JVM engine/compilation evidence is under
 `arouter-compiler-ksp/build/reports/ksp-jvm`.
 
-This milestone explicitly rejects source Autowired/Interceptor annotations.
-The JVM fixture's Android stubs establish compiler behavior, while only the
-device fixture establishes actual navigation. This does not yet establish
-complete KSP parity, performance gains, or the runtime's minimum Android API.
+The supported Kotlin injection field shapes and explicit diagnostics are
+documented in the compiler README. The JVM fixture's Android stubs establish
+compiler behavior, while the device fixture establishes actual navigation.
+These checks do not establish performance gains or the runtime's minimum Android API.
 
 ## Complete framework device suite
 

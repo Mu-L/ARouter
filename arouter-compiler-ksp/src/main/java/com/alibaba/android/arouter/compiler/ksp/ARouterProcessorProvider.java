@@ -8,6 +8,6 @@ import com.google.devtools.ksp.processing.SymbolProcessorProvider;
 public final class ARouterProcessorProvider implements SymbolProcessorProvider {
     @Override
     public SymbolProcessor create(SymbolProcessorEnvironment environment) {
-        return new RouteSymbolProcessor(environment);
+        return new ARouterSymbolProcessor(environment);
     }
 }

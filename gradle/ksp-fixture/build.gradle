@@ -16,6 +16,10 @@ buildscript {
     }
 }
 
+plugins {
+    id 'com.android.legacy-kapt' version '9.3.2' apply false
+}
+
 allprojects {
     repositories {
         maven { url uri(rootProject.providers.gradleProperty('arouter.repository').get()) }

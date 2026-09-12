@@ -1,25 +1,18 @@
 package com.alibaba.android.arouter.compiler.ksp;
 
-import com.google.devtools.ksp.UtilsKt;
 import com.google.devtools.ksp.processing.Dependencies;
 import com.google.devtools.ksp.processing.KSPLogger;
 import com.google.devtools.ksp.processing.Resolver;
-import com.google.devtools.ksp.processing.SymbolProcessor;
 import com.google.devtools.ksp.processing.SymbolProcessorEnvironment;
 import com.google.devtools.ksp.symbol.ClassKind;
 import com.google.devtools.ksp.symbol.KSAnnotated;
-import com.google.devtools.ksp.symbol.KSAnnotation;
 import com.google.devtools.ksp.symbol.KSClassDeclaration;
 import com.google.devtools.ksp.symbol.KSDeclaration;
 import com.google.devtools.ksp.symbol.KSFile;
 import com.google.devtools.ksp.symbol.KSNode;
 import com.google.devtools.ksp.symbol.KSPropertyDeclaration;
 import com.google.devtools.ksp.symbol.KSType;
-import com.google.devtools.ksp.symbol.KSTypeAlias;
-import com.google.devtools.ksp.symbol.KSTypeArgument;
-import com.google.devtools.ksp.symbol.KSTypeParameter;
 import com.google.devtools.ksp.symbol.KSTypeReference;
-import com.google.devtools.ksp.symbol.KSValueArgument;
 import com.squareup.javapoet.ClassName;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -27,23 +20,25 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import javax.lang.model.SourceVersion;
+import com.alibaba.android.arouter.compiler.ksp.KspSymbols.UnresolvedType;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.annotation;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.binaryName;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.expand;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.hierarchy;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.integer;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.parameterKind;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.qualifiedName;
+import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.string;
 
-/**
- * Phase one supports route and provider registration. Source injection and interceptor
- * annotations fail explicitly; a precompiled dependency may still supply APT-generated
- * injection helpers, whose inherited parameter metadata is included here.
- */
-final class RouteSymbolProcessor implements SymbolProcessor {
+/** Aggregates route/provider registries, including inherited injection metadata. */
+final class RouteSymbolProcessor implements ManagedSymbolProcessor {
     private static final String ROUTE = "com.alibaba.android.arouter.facade.annotation.Route";
     private static final String AUTOWIRED = "com.alibaba.android.arouter.facade.annotation.Autowired";
-    private static final String INTERCEPTOR = "com.alibaba.android.arouter.facade.annotation.Interceptor";
     private static final String PROVIDER = "com.alibaba.android.arouter.facade.template.IProvider";
     private static final String MODULE_OPTION = "AROUTER_MODULE_NAME";
     private final KSPLogger logger;
@@ -52,11 +47,12 @@ final class RouteSymbolProcessor implements SymbolProcessor {
     private final boolean generateDocs;
     private final Map<String, RouteModel> routesByClass = new TreeMap<>();
     private final Map<String, String> unresolved = new TreeMap<>();
-    private final Set<String> unsupportedReported = new HashSet<>();
     // Replaced with this round's files on every process invocation. No resolver or
     // declaration/type symbol is reused in a subsequent round.
     private List<KSFile> finalRoundFiles = Collections.emptyList();
     private boolean failed;
+    private boolean prepared;
+    private List<RouteModel> finalRoutes = Collections.emptyList();
 
     RouteSymbolProcessor(SymbolProcessorEnvironment environment) {
         logger = environment.getLogger();
@@ -82,9 +78,6 @@ final class RouteSymbolProcessor implements SymbolProcessor {
             files.add(sourceFiles.next());
         }
         finalRoundFiles = files;
-        rejectUnsupported(resolver, AUTOWIRED);
-        rejectUnsupported(resolver, INTERCEPTOR);
-
         List<KSAnnotated> deferred = new ArrayList<>();
         Iterator<KSAnnotated> symbols = resolver.getSymbolsWithAnnotation(ROUTE, false).iterator();
         while (symbols.hasNext()) {
@@ -121,7 +114,11 @@ final class RouteSymbolProcessor implements SymbolProcessor {
     }
 
     @Override
-    public void finish() {
+    public void prepareFinish() {
+        if (prepared) {
+            return;
+        }
+        prepared = true;
         for (Map.Entry<String, String> entry : unresolved.entrySet()) {
             error("Cannot resolve types needed by @Route [" + entry.getKey() + "]: "
                     + entry.getValue() + ". Ensure the type is on the compilation classpath "
@@ -133,6 +130,16 @@ final class RouteSymbolProcessor implements SymbolProcessor {
             return group == 0 ? left.path.compareTo(right.path) : group;
         });
         validateUniqueRegistrations(routes);
+        finalRoutes = routes;
+    }
+
+    @Override
+    public boolean hasErrors() {
+        return failed;
+    }
+
+    @Override
+    public void emitFinish() {
         if (failed) {
             return;
         }
@@ -140,7 +147,7 @@ final class RouteSymbolProcessor implements SymbolProcessor {
             // Every output is aggregating: adding a route can change a group, root,
             // provider index or JSON document. Include all current source roots so
             // unrelated-to-annotated source edits and deleting the last route are safe.
-            emitter.emit(module, generateDocs, routes,
+            emitter.emit(module, generateDocs, finalRoutes,
                     new Dependencies(true, finalRoundFiles.toArray(new KSFile[0])));
         } catch (IOException exception) {
             error("Could not generate route tables: " + exception.getMessage()
@@ -151,25 +158,6 @@ final class RouteSymbolProcessor implements SymbolProcessor {
     @Override
     public void onError() {
         failed = true;
-    }
-
-    private void rejectUnsupported(Resolver resolver, String annotationName) {
-        Iterator<KSAnnotated> symbols = resolver.getSymbolsWithAnnotation(annotationName, false).iterator();
-        while (symbols.hasNext()) {
-            KSAnnotated symbol = symbols.next();
-            if (UtilsKt.getContainingFile(symbol) == null) {
-                continue;
-            }
-            String key = annotationName + ":" + symbol.getLocation();
-            if (unsupportedReported.add(key)) {
-                error("ARouter KSP phase one supports @Route and provider registration only; "
-                        + "@" + annotationName.substring(annotationName.lastIndexOf('.') + 1)
-                        + " is not supported in this module yet. Keep this module on "
-                        + "arouter-compiler with APT/KAPT. Do not enable both ARouter backends "
-                        + "in one module. Precompiled dependencies may keep their APT-generated helpers.",
-                        symbol);
-            }
-        }
     }
 
     private RouteModel parse(KSClassDeclaration declaration, Resolver resolver) {
@@ -295,43 +283,6 @@ final class RouteSymbolProcessor implements SymbolProcessor {
         }
     }
 
-    private int parameterKind(KSType type, Resolver resolver) {
-        String name = qualifiedName(expand(type).getDeclaration());
-        if (name != null) {
-            switch (name) {
-                case "kotlin.Boolean": case "java.lang.Boolean": return 0;
-                case "kotlin.Byte": case "java.lang.Byte": return 1;
-                case "kotlin.Short": case "java.lang.Short": return 2;
-                case "kotlin.Int": case "java.lang.Integer": return 3;
-                case "kotlin.Long": case "java.lang.Long": return 4;
-                case "kotlin.Char": case "java.lang.Character": return 5;
-                case "kotlin.Float": case "java.lang.Float": return 6;
-                case "kotlin.Double": case "java.lang.Double": return 7;
-                case "kotlin.String": case "java.lang.String": return 8;
-                // Every JVM array is Serializable, even when Kotlin's source-level
-                // array declaration does not list that Java superinterface.
-                case "kotlin.Array":
-                case "kotlin.BooleanArray": case "kotlin.ByteArray":
-                case "kotlin.ShortArray": case "kotlin.IntArray":
-                case "kotlin.LongArray": case "kotlin.CharArray":
-                case "kotlin.FloatArray": case "kotlin.DoubleArray": return 9;
-                default: break;
-            }
-        }
-        if (isAssignableTo(type, "android.os.Parcelable", resolver)) {
-            return 10;
-        }
-        if (isAssignableTo(type, "java.io.Serializable", resolver)) {
-            return 9;
-        }
-        return 11;
-    }
-
-    private static boolean isAssignableTo(KSType type, String name, Resolver resolver) {
-        KSClassDeclaration target = resolver.getClassDeclarationByName(resolver.getKSNameFromString(name));
-        return target != null && target.asStarProjectedType().isAssignableFrom(type.makeNotNullable());
-    }
-
     private void validateUniqueRegistrations(List<RouteModel> routes) {
         Map<String, RouteModel> paths = new HashMap<>();
         Map<String, RouteModel> providerKeys = new HashMap<>();
@@ -357,148 +308,13 @@ final class RouteSymbolProcessor implements SymbolProcessor {
     }
 
     private ClassName accessibleClassName(KSClassDeclaration declaration) {
-        List<String> names = new ArrayList<>();
-        KSDeclaration current = declaration;
-        while (current != null) {
-            if (!(current instanceof KSClassDeclaration)
-                    || (!UtilsKt.isPublic(current) && !UtilsKt.isInternal(current))) {
-                error("@Route destination [" + qualifiedName(declaration)
-                        + "] and its enclosing classes must be accessible from the generated route package.",
-                        declaration);
-                return null;
-            }
-            String name = current.getSimpleName().asString();
-            if (!SourceVersion.isIdentifier(name) || SourceVersion.isKeyword(name)) {
-                error("@Route destination [" + qualifiedName(declaration)
-                        + "] must have a name that can be referenced from generated Java.", declaration);
-                return null;
-            }
-            names.add(0, name);
-            current = current.getParentDeclaration();
-        }
-        String packageName = declaration.getPackageName().asString();
-        if (packageName.isEmpty()) {
-            error("@Route destination must belong to a named package.", declaration);
+        try {
+            KspSymbols.requireAccessible(declaration, RouteEmitter.PACKAGE);
+            return KspSymbols.className(declaration);
+        } catch (KspSymbols.InvalidSymbol exception) {
+            error("@Route " + exception.getMessage(), declaration);
             return null;
         }
-        for (String part : packageName.split("\\.")) {
-            if (!SourceVersion.isIdentifier(part) || SourceVersion.isKeyword(part)) {
-                error("@Route destination package must be accessible from generated Java.", declaration);
-                return null;
-            }
-        }
-        return ClassName.get(packageName, names.get(0),
-                names.subList(1, names.size()).toArray(new String[0]));
-    }
-
-    private static String binaryName(KSClassDeclaration declaration) {
-        List<String> names = new ArrayList<>();
-        KSDeclaration current = declaration;
-        while (current instanceof KSClassDeclaration) {
-            names.add(0, current.getSimpleName().asString());
-            current = current.getParentDeclaration();
-        }
-        return declaration.getPackageName().asString() + "." + String.join("$", names);
-    }
-
-    private static Set<String> hierarchy(KSType type) {
-        Set<String> names = new LinkedHashSet<>();
-        collectHierarchy(type, names, new HashSet<>());
-        return names;
-    }
-
-    private static void collectHierarchy(KSType type, Set<String> names, Set<String> visited) {
-        type = expand(type);
-        KSDeclaration declaration = type.getDeclaration();
-        String key = qualifiedName(declaration);
-        if (key == null) {
-            KSDeclaration owner = declaration.getParentDeclaration();
-            key = (owner == null ? "" : qualifiedName(owner)) + ":" + declaration;
-        }
-        if (!visited.add(key)) {
-            return;
-        }
-        names.add(key);
-        if (declaration instanceof KSClassDeclaration) {
-            Iterator<KSTypeReference> supers =
-                    ((KSClassDeclaration) declaration).getSuperTypes().iterator();
-            while (supers.hasNext()) {
-                collectHierarchy(supers.next().resolve(), names, visited);
-            }
-        } else if (declaration instanceof KSTypeParameter) {
-            Iterator<KSTypeReference> bounds = ((KSTypeParameter) declaration).getBounds().iterator();
-            while (bounds.hasNext()) {
-                collectHierarchy(bounds.next().resolve(), names, visited);
-            }
-        }
-    }
-
-    private static KSType expand(KSType type) {
-        requireResolved(type, new HashSet<>());
-        Set<String> aliases = new HashSet<>();
-        while (type.getDeclaration() instanceof KSTypeAlias) {
-            KSTypeAlias alias = (KSTypeAlias) type.getDeclaration();
-            if (!aliases.add(qualifiedName(alias))) {
-                throw new UnresolvedType("cyclic type alias " + alias.getSimpleName().asString());
-            }
-            type = alias.getType().resolve();
-            requireResolved(type, new HashSet<>());
-        }
-        return type;
-    }
-
-    private static void requireResolved(KSType type, Set<String> visited) {
-        if (type.isError()) {
-            throw new UnresolvedType(type.toString());
-        }
-        if (!visited.add(type.toString())) {
-            return;
-        }
-        if (type.getDeclaration() instanceof KSTypeAlias) {
-            requireResolved(((KSTypeAlias) type.getDeclaration()).getType().resolve(), visited);
-        }
-        // In KSP2 a container may be valid while one of its type arguments is an error.
-        // Star projections legitimately have no type reference.
-        for (KSTypeArgument argument : type.getArguments()) {
-            if (argument.getType() != null) {
-                requireResolved(argument.getType().resolve(), visited);
-            }
-        }
-    }
-
-    private static Map<String, Object> annotation(KSAnnotated annotated, String name) {
-        Iterator<KSAnnotation> annotations = annotated.getAnnotations().iterator();
-        while (annotations.hasNext()) {
-            KSAnnotation annotation = annotations.next();
-            KSType type = annotation.getAnnotationType().resolve();
-            if (type.isError()) {
-                throw new UnresolvedType("annotation " + annotation.getShortName().asString());
-            }
-            if (name.equals(qualifiedName(type.getDeclaration()))) {
-                Map<String, Object> result = new LinkedHashMap<>();
-                for (KSValueArgument argument : annotation.getArguments()) {
-                    if (argument.getName() != null) {
-                        result.put(argument.getName().asString(), argument.getValue());
-                    }
-                }
-                return result;
-            }
-        }
-        return null;
-    }
-
-    private static String qualifiedName(KSDeclaration declaration) {
-        return declaration.getQualifiedName() == null ? null : declaration.getQualifiedName().asString();
-    }
-
-    private static String string(Map<String, Object> values, String name) {
-        Object value = values.get(name);
-        return value instanceof String ? (String) value : "";
-    }
-
-    private static int integer(Map<String, Object> values, String name, int defaultValue) {
-        Object value = values.get(name);
-        return value instanceof Number ? ((Number) value).intValue() : defaultValue;
     }
 
     private void error(String message, KSNode node) {
@@ -506,11 +322,4 @@ final class RouteSymbolProcessor implements SymbolProcessor {
         logger.error("ARouter: " + message, node);
     }
 
-    private static final class UnresolvedType extends RuntimeException {
-        private static final long serialVersionUID = 1L;
-
-        UnresolvedType(String detail) {
-            super(detail);
-        }
-    }
 }

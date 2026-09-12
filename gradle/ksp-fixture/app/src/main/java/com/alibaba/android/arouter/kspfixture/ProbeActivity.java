@@ -7,6 +7,9 @@ import androidx.fragment.app.Fragment;
 
 import com.alibaba.android.arouter.kspfixture.legacy.LegacyService;
 import com.alibaba.android.arouter.launcher.ARouter;
+import com.alibaba.android.arouter.facade.Postcard;
+import com.alibaba.android.arouter.facade.callback.NavigationCallback;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class ProbeActivity extends Activity {
     @Override
@@ -15,10 +18,10 @@ public final class ProbeActivity extends Activity {
         ARouter.init(getApplication());
 
         // Both route tables are discovered by the existing register plugin:
-        // this module uses KSP, while the dependency uses Java APT.
+        // this module uses KSP, while the dependency uses Java/Kotlin KAPT.
         LegacyService legacy = ARouter.getInstance().navigation(LegacyService.class);
         KspService modern = ARouter.getInstance().navigation(KspService.class);
-        if (legacy == null || !"apt".equals(legacy.backend())
+        if (legacy == null || !"kapt".equals(legacy.backend())
                 || modern == null || !"ksp".equals(modern.backend())) {
             throw new IllegalStateException("Cannot resolve providers from both processor backends");
         }
@@ -29,10 +32,31 @@ public final class ProbeActivity extends Activity {
 
         assertFragment("/ksp/java-fragment", JavaFragment.class);
         assertFragment("/ksp/kotlin-fragment", KotlinFragment.class);
+        InjectionChecks.run();
 
-        // The Java route then navigates to the Kotlin route. Instrumentation
-        // observes the final component, so class retention is exercised by R8.
-        ARouter.getInstance().build("/ksp/java").withString("source", "probe").navigation(this);
+        // Start the successful route only after the earlier navigation has
+        // actually been cancelled. No blocking wait runs on the main thread.
+        final AtomicInteger interrupts = new AtomicInteger();
+        ARouter.getInstance().build("/ksp/java").withBoolean("cancel", true)
+                .withString("source", "cancelled").navigation(this, new NavigationCallback() {
+                    @Override public void onFound(Postcard postcard) {}
+                    @Override public void onLost(Postcard postcard) {
+                        throw new IllegalStateException("Cancellation fixture route was not found");
+                    }
+                    @Override public void onArrival(Postcard postcard) {
+                        throw new IllegalStateException("Cancelled navigation arrived");
+                    }
+                    @Override public void onInterrupt(Postcard postcard) {
+                        InjectionChecks.check(interrupts.incrementAndGet() == 1, "Cancellation callback count");
+                        InjectionChecks.checkTrace(postcard.getExtras().getString("trace"));
+                        runOnUiThread(new Runnable() {
+                            @Override public void run() {
+                                ARouter.getInstance().build("/ksp/java")
+                                        .withString("source", "probe").navigation(ProbeActivity.this);
+                            }
+                        });
+                    }
+                });
     }
 
     private void assertFragment(String path, Class<? extends Fragment> expected) {

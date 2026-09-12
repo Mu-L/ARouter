@@ -672,9 +672,9 @@ ARouter 运行库仍保持 `minSdkVersion=14`。示例应用及其中使用 Gson
     }
     ```
 
-    仓库另有独立的 [KSP2 开发版编译器](arouter-compiler-ksp/README.md)，目前支持路由和
-    Provider 注册，尚未发布，也尚未实现 Autowired/Interceptor 代码生成；使用这些注解的模块
-    继续保留 KAPT。完整构建方式和验证范围见该模块文档。
+    仓库另有独立的 [KSP2 开发版编译器](arouter-compiler-ksp/README.md)，支持路由、
+    Provider、Autowired 和 Interceptor，尚未发布。迁移前请确认 Kotlin 字段要求和已验证的
+    工具链组合；完整构建方式和验证范围见该模块文档。
 
 #### 七、Q&A
 

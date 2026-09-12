@@ -15,8 +15,8 @@ public final class LegacyProvider implements LegacyService {
     @Override
     public String backend() {
         if (!initialized) {
-            throw new IllegalStateException("APT provider was not initialized");
+            throw new IllegalStateException("KAPT provider was not initialized");
         }
-        return "apt";
+        return "kapt";
     }
 }

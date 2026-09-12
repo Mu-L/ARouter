@@ -634,8 +634,8 @@ annotation，**Only the routing information of the same group can be registered 
     ```
 
     A separate [KSP2 development compiler](arouter-compiler-ksp/README.md) supports
-    route and provider registration. It is not published and does not yet generate
-    Autowired or Interceptor code; modules using those annotations should retain KAPT.
+    routes, providers, Autowired and Interceptor. It is not published; review its
+    Kotlin field requirements and tested toolchain before migrating a module.
 
 #### VII. Communication
 

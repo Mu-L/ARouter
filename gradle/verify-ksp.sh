@@ -125,6 +125,8 @@ verify_registrations() {
         sed 's/^.*\/\/ String //')"
     local expected
     expected="$(printf '%s\n' \
+        'com.alibaba.android.arouter.routes.ARouter$$Interceptors$$aptfeature' \
+        'com.alibaba.android.arouter.routes.ARouter$$Interceptors$$kspapp' \
         'com.alibaba.android.arouter.routes.ARouter$$Providers$$aptfeature' \
         'com.alibaba.android.arouter.routes.ARouter$$Providers$$arouterapi' \
         'com.alibaba.android.arouter.routes.ARouter$$Providers$$kspapp' \
@@ -132,7 +134,7 @@ verify_registrations() {
         'com.alibaba.android.arouter.routes.ARouter$$Root$$arouterapi' \
         'com.alibaba.android.arouter.routes.ARouter$$Root$$kspapp')"
     if [[ "${actual}" != "${expected}" ]]; then
-        echo "Unexpected APT/KSP route registrations for ${variant}:" >&2
+        echo "Unexpected KAPT/KSP route registrations for ${variant}:" >&2
         echo "${actual}" >&2
         exit 1
     fi
@@ -204,8 +206,8 @@ while IFS= read -r -d '' route_source; do
     mv "${route_source}.no-routes" "${route_source}"
     annotation_count=$((annotation_count + 1))
 done < <(find "${project_dir}/app/src/main" -type f \( -name '*.java' -o -name '*.kt' \) -print0)
-if [[ "${annotation_count}" != 5 ]]; then
-    echo "Expected to remove all five KSP fixture route annotations, found ${annotation_count}." >&2
+if [[ "${annotation_count}" != 7 ]]; then
+    echo "Expected to remove all seven KSP fixture route annotations, found ${annotation_count}." >&2
     exit 1
 fi
 "${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/empty-module-build.log"
@@ -238,6 +240,74 @@ for variant in debug release; do
     grep -F '"/ksp/java-updated"' "${generated_dir}/ARouter\$\$Group\$\$ksp.java"
     grep -F '"ksp"' "${generated_dir}/ARouter\$\$Root\$\$kspapp.java"
     grep -F '"com.alibaba.android.arouter.kspfixture.KspService"' "${generated_dir}/ARouter\$\$Providers\$\$kspapp.java"
+    verify_registrations "${variant}"
+done
+
+# A newly injected target must get its own helper; removing the source must
+# remove that helper from KSP output and the next Java compilation.
+injected_source="${project_dir}/app/src/main/java/com/alibaba/android/arouter/kspfixture/IncrementalTarget.java"
+cat > "${injected_source}" <<'JAVA'
+package com.alibaba.android.arouter.kspfixture;
+public final class IncrementalTarget {
+    @com.alibaba.android.arouter.facade.annotation.Autowired public KspService provider;
+}
+JAVA
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/added-helper-build.log"
+for variant in debug release; do
+    test -s "${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/kspfixture/IncrementalTarget\$\$ARouter\$\$Autowired.java"
+done
+mv "${injected_source}" "${test_root}/removed-IncrementalTarget.java"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/removed-helper-build.log"
+for variant in debug release; do
+    if find "${project_dir}/app/build/generated/ksp/${variant}" -type f \
+            -name 'IncrementalTarget$$ARouter$$Autowired.java' | grep . >/dev/null; then
+        echo "Deleted injection helper remains in ${variant} KSP output." >&2
+        exit 1
+    fi
+    while IFS= read -r candidate; do
+        if jar tf "${candidate}" | grep -F 'IncrementalTarget$$ARouter$$Autowired.class' >/dev/null; then
+            echo "Deleted injection helper remains in ${variant} bytecode." >&2
+            exit 1
+        fi
+    done < <(find "${project_dir}/app/build/intermediates/classes/${variant}" -type f -name '*.jar')
+done
+
+# Delete all KSP interceptor annotations but leave concrete classes referenced
+# by the fixture in place. The aggregate interceptor registry must become empty.
+saved_interceptors="${test_root}/annotated-interceptors"
+interceptor_count=0
+while IFS= read -r -d '' interceptor_source; do
+    if ! grep -Eq '^[[:space:]]*@Interceptor\(' "${interceptor_source}"; then continue; fi
+    relative_source="${interceptor_source#${project_dir}/}"
+    saved_source="${saved_interceptors}/${relative_source}"
+    mkdir -p "$(dirname "${saved_source}")"
+    cp -p "${interceptor_source}" "${saved_source}"
+    sed '/^[[:space:]]*@Interceptor[(]/d' "${interceptor_source}" > "${interceptor_source}.no-interceptors"
+    mv "${interceptor_source}.no-interceptors" "${interceptor_source}"
+    interceptor_count=$((interceptor_count + 1))
+done < <(find "${project_dir}/app/src/main" -type f \( -name '*.java' -o -name '*.kt' \) -print0)
+if [[ "${interceptor_count}" != 2 ]]; then
+    echo "Expected two KSP interceptors, found ${interceptor_count}." >&2
+    exit 1
+fi
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/empty-interceptors-build.log"
+for variant in debug release; do
+    registry="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes/ARouter\$\$Interceptors\$\$kspapp.java"
+    test -s "${registry}"
+    if grep -Fq 'interceptors.put(' "${registry}"; then
+        echo "Stale interceptor entry remains after deleting final annotation (${variant})." >&2
+        exit 1
+    fi
+done
+rsync -a "${saved_interceptors}/" "${project_dir}/"
+while IFS= read -r -d '' saved_source; do
+    cmp "${saved_source}" "${project_dir}/${saved_source#${saved_interceptors}/}"
+done < <(find "${saved_interceptors}" -type f -print0)
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/restored-interceptors-build.log"
+for variant in debug release; do
+    registry="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes/ARouter\$\$Interceptors\$\$kspapp.java"
+    grep -F 'interceptors.put(-10,' "${registry}"
+    grep -F 'interceptors.put(10,' "${registry}"
     verify_registrations "${variant}"
 done
 

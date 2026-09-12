@@ -32,6 +32,17 @@ public final class RoundGeneratingProvider implements SymbolProcessorProvider {
                 write("GeneratedActivity",
                         "@com.alibaba.android.arouter.facade.annotation.Route(path = \"" + path + "\") "
                         + "public class GeneratedActivity extends GeneratedBase {}");
+                if ("features".equals(environment.getOptions().get("probe.generate"))) {
+                    write("GeneratedPayload", "public class GeneratedPayload {}");
+                    write("GeneratedInjected", "public class GeneratedInjected extends android.app.Activity {"
+                            + "@com.alibaba.android.arouter.facade.annotation.Autowired public int count=3; }");
+                    write("GeneratedInterceptor",
+                            "@com.alibaba.android.arouter.facade.annotation.Interceptor(priority=31)"
+                            + "public class GeneratedInterceptor implements com.alibaba.android.arouter.facade.template.IInterceptor {"
+                            + "public void init(android.content.Context c) {}"
+                            + "public void process(com.alibaba.android.arouter.facade.Postcard p,"
+                            + "com.alibaba.android.arouter.facade.callback.InterceptorCallback c) {c.onContinue(p);} }");
+                }
                 return Collections.emptyList();
             }
 
