@@ -1,0 +1,120 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+
+group = GROUP
+version = VERSION_NAME
+
+def repositoryRoot = rootDir.parentFile
+def localRepository = providers.gradleProperty('arouter.repository')
+        .orElse(new File(repositoryRoot, 'build/localMaven').absolutePath)
+
+repositories {
+    maven {
+        url = uri(localRepository.get())
+        content { includeGroup 'com.alibaba' }
+    }
+    mavenCentral()
+}
+
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(17) }
+    withSourcesJar()
+    withJavadocJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 8
+    options.encoding = 'UTF-8'
+}
+
+configurations {
+    kspTestRuntime {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+    kspKotlinRuntime {
+        canBeConsumed = false
+        canBeResolved = true
+    }
+}
+
+dependencies {
+    compileOnly "com.google.devtools.ksp:symbol-processing-api:${KSP_VERSION}"
+    implementation 'com.squareup:javapoet:1.13.0'
+    implementation 'com.google.code.gson:gson:2.14.0'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation "com.google.devtools.ksp:symbol-processing-api:${KSP_VERSION}"
+    kspTestRuntime "com.google.devtools.ksp:symbol-processing-aa-embeddable:${KSP_VERSION}"
+    kspTestRuntime "com.google.devtools.ksp:symbol-processing-common-deps:${KSP_VERSION}"
+    kspTestRuntime "com.google.devtools.ksp:symbol-processing-api:${KSP_VERSION}"
+    kspTestRuntime "org.jetbrains.kotlin:kotlin-stdlib:${KOTLIN_VERSION}"
+    kspTestRuntime 'org.jetbrains:annotations:13.0'
+    kspKotlinRuntime "org.jetbrains.kotlin:kotlin-compiler-embeddable:${KOTLIN_VERSION}"
+    kspKotlinRuntime "org.jetbrains.kotlin:kotlin-stdlib:${KOTLIN_VERSION}"
+    kspKotlinRuntime 'org.jetbrains:annotations:13.0'
+}
+
+tasks.named('test', Test) {
+    useJUnit()
+    maxParallelForks = 1
+    // The regression harness launches real compiler processes. Resolve their
+    // classpaths explicitly; Gradle's isolated test worker classpath is not one.
+    inputs.files(configurations.kspTestRuntime, configurations.kspKotlinRuntime)
+    // Fixtures compile these real contracts from the legacy build. Changes to
+    // them must invalidate tests even though they are outside this build root.
+    inputs.files(fileTree('../arouter-annotation/src/main/java'),
+            fileTree('../arouter-api/src/main/java'))
+    doFirst {
+        systemProperty 'arouter.ksp.test.classpath', configurations.kspTestRuntime.asPath
+        systemProperty 'arouter.ksp.kotlin.classpath', configurations.kspKotlinRuntime.asPath
+        systemProperty 'arouter.ksp.processor.classpath', sourceSets.main.runtimeClasspath.asPath
+        systemProperty 'arouter.repo.root', repositoryRoot.absolutePath
+        systemProperty 'arouter.ksp.test.java.home', javaLauncher.get().metadata.installationPath.asFile.absolutePath
+    }
+    testLogging { events 'failed', 'skipped' }
+}
+
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            pom {
+                name = 'ARouter KSP Compiler'
+                description = 'KSP2 route compiler for ARouter (development milestone)'
+                url = 'https://github.com/alibaba/ARouter'
+                licenses {
+                    license {
+                        name = 'The Apache Software License, Version 2.0'
+                        url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                    }
+                }
+                scm {
+                    url = 'https://github.com/alibaba/ARouter'
+                    connection = 'scm:git:https://github.com/alibaba/ARouter.git'
+                }
+            }
+        }
+    }
+    // Deliberately local only: release coordinates and remote publication are
+    // outside this migration milestone.
+    repositories {
+        maven {
+            name = 'localStaging'
+            url = uri(localRepository.get())
+        }
+    }
+}
+
+tasks.register('installLocally') {
+    group = 'publishing'
+    description = 'Stages this development compiler beside the legacy ARouter artifacts.'
+    dependsOn 'publishMavenJavaPublicationToLocalStagingRepository'
+}

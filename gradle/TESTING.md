@@ -6,6 +6,52 @@ The complete demo CI matrix runs on API 21 and API 34. Minimum-API framework
 and consumer checks are separate; they do not establish coverage for every
 intermediate API level.
 
+## KSP2 compiler development checks
+
+The independent [KSP compiler](../arouter-compiler-ksp/README.md) and
+[Android fixture](ksp-fixture) use JDK 17, KSP 2.3.12, Kotlin 2.3.20 and
+SDK/build-tools 36/36.0.0. The compiler itself uses Gradle 9.5.0. Consumer
+rows use AGP 8.12.0 / Gradle 8.13, AGP 9.0.0 / Gradle 9.1.0, and
+AGP 9.3.2 / Gradle 9.5.0. The legacy wrapper and APT/KAPT build retain their
+existing toolchain.
+
+Stage the four legacy local artifacts with JDK 8 using the commands below,
+then switch to JDK 17:
+
+```sh
+./arouter-compiler-ksp/gradlew -p arouter-compiler-ksp test installLocally
+./gradle/verify-ksp.sh
+AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+AROUTER_AGP_VERSION=8.12.0 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+AROUTER_AGP_VERSION=9.0.0 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+AROUTER_EXPECT_API=21 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+```
+
+Device commands require exactly one booted emulator. The default expected API
+is 34; switch to an API 21 emulator for the last command. CI includes all three
+AGP rows on API 34 and the current AGP 9.3.2 row on API 21. The script checks
+observed Gradle/plugin/JDK versions and device API for each exact row.
+It exercises mixed KAPT/KSP module registration, actual Java/Kotlin Activity
+navigation, field injection, inherited/nested helpers, generic serialization,
+Fragment arguments, provider lookup and interception in Debug and Release/R8.
+The fixture has no test-only keep rules. The verifier also checks configuration
+cache reuse, incremental route changes and compiler/runtime dependency isolation.
+It preserves isolated fixture copies, logs, fresh device reports and R8 mappings
+under `build/reports/ksp-consumer`; JVM engine/compilation evidence is under
+`arouter-compiler-ksp/build/reports/ksp-jvm`.
+
+The supported Kotlin injection field shapes and explicit diagnostics are
+documented in the compiler README. The JVM fixture's Android stubs establish
+compiler behavior, while the device fixture establishes actual navigation.
+These checks do not establish performance gains or the runtime's minimum Android API.
+
+For a separate controlled performance comparison, see the
+[benchmark protocol](ksp-benchmark-fixture/README.md) and
+[recorded results](../arouter-compiler-ksp/BENCHMARK.md). The driver validates
+identical source/dependency inputs and actual completed work before admitting
+each sample. Performance results are machine- and workload-specific; they are
+not a timing threshold in CI.
+
 ## Complete framework device suite
 
 Use JDK 8 and connect exactly one booted Android emulator. The script rejects

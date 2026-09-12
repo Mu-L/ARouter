@@ -633,6 +633,10 @@ annotation，**Only the routing information of the same group can be registered 
     }
     ```
 
+    A separate [KSP2 development compiler](arouter-compiler-ksp/README.md) supports
+    routes, providers, Autowired and Interceptor. It is not published; review its
+    Kotlin field requirements and tested toolchain before migrating a module.
+
 #### VII. Communication
 
 1. Communication

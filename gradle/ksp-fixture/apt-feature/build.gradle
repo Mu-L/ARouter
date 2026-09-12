@@ -1,0 +1,36 @@
+apply plugin: 'com.android.library'
+if (rootProject.fixtureBuiltInKotlin) {
+    apply plugin: 'com.android.legacy-kapt'
+} else {
+    apply plugin: 'org.jetbrains.kotlin.android'
+    apply plugin: 'org.jetbrains.kotlin.kapt'
+}
+
+android {
+    namespace 'com.alibaba.android.arouter.kspfixture.legacy'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+    defaultConfig {
+        minSdk 21
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+kapt {
+    arguments { arg('AROUTER_MODULE_NAME', 'aptfeature') }
+    includeCompileClasspath = false
+}
+
+kotlin {
+    compilerOptions { jvmTarget = JvmTarget.JVM_1_8 }
+}
+
+dependencies {
+    api "com.alibaba:arouter-api:${rootProject.property('arouter.api.version')}"
+    api 'androidx.fragment:fragment:1.0.0'
+    kapt "com.alibaba:arouter-compiler:${rootProject.property('arouter.compiler.version')}"
+}
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget

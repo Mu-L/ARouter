@@ -1,0 +1,52 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+apply plugin: 'com.android.application'
+if (!rootProject.fixtureBuiltInKotlin) {
+    apply plugin: 'org.jetbrains.kotlin.android'
+}
+apply plugin: 'com.google.devtools.ksp'
+apply plugin: 'com.alibaba.arouter'
+
+android {
+    namespace 'com.alibaba.android.arouter.kspfixture'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+    if (rootProject.hasProperty('arouter.test.build.type')) {
+        testBuildType rootProject.property('arouter.test.build.type')
+    }
+    defaultConfig {
+        applicationId 'com.alibaba.android.arouter.kspfixture'
+        minSdk 21
+        targetSdk 36
+        versionCode 1
+        versionName '1.0'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            signingConfig signingConfigs.debug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+kotlin {
+    compilerOptions { jvmTarget = JvmTarget.JVM_1_8 }
+}
+
+ksp {
+    arg('AROUTER_MODULE_NAME', 'kspapp')
+}
+
+dependencies {
+    implementation "com.alibaba:arouter-api:${rootProject.property('arouter.api.version')}"
+    implementation 'androidx.fragment:fragment:1.0.0'
+    implementation project(':apt-feature')
+    ksp "com.alibaba:arouter-compiler-ksp:${rootProject.property('arouter.ksp.compiler.version')}"
+    androidTestImplementation 'androidx.test:runner:1.3.0'
+}
