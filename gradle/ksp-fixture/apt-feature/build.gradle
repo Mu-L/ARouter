@@ -1,0 +1,24 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'com.alibaba.android.arouter.kspfixture.legacy'
+    compileSdk 36
+    buildToolsVersion '36.0.0'
+    defaultConfig {
+        minSdk 21
+        javaCompileOptions {
+            annotationProcessorOptions {
+                arguments = [AROUTER_MODULE_NAME: 'aptfeature']
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    api "com.alibaba:arouter-api:${rootProject.property('arouter.api.version')}"
+    annotationProcessor "com.alibaba:arouter-compiler:${rootProject.property('arouter.compiler.version')}"
+}

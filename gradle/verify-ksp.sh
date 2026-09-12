@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+local_repository="${repo_root}/build/localMaven"
+run_device_tests="${AROUTER_RUN_DEVICE_TESTS:-false}"
+case "${run_device_tests}" in
+    true|false) ;;
+    *) echo "AROUTER_RUN_DEVICE_TESTS must be true or false." >&2; exit 1 ;;
+esac
+
+read_version() {
+    awk -F= '$1 == "VERSION_NAME" { print $2; exit }' "$1"
+}
+annotation_version="$(read_version "${repo_root}/arouter-annotation/gradle.properties")"
+api_version="$(read_version "${repo_root}/arouter-api/gradle.properties")"
+compiler_version="$(read_version "${repo_root}/arouter-compiler/gradle.properties")"
+register_version="$(read_version "${repo_root}/arouter-gradle-plugin/gradle.properties")"
+ksp_compiler_version="$(read_version "${repo_root}/arouter-compiler-ksp/gradle.properties")"
+for artifact in \
+    "arouter-annotation/${annotation_version}/arouter-annotation-${annotation_version}.jar" \
+    "arouter-api/${api_version}/arouter-api-${api_version}.aar" \
+    "arouter-compiler/${compiler_version}/arouter-compiler-${compiler_version}.jar" \
+    "arouter-register/${register_version}/arouter-register-${register_version}.jar"; do
+    if [[ ! -s "${local_repository}/com/alibaba/${artifact}" ]]; then
+        echo "Missing local ARouter artifact: ${artifact}" >&2
+        echo "First run the four legacy installLocally tasks using JDK 8." >&2
+        exit 1
+    fi
+done
+
+java_command="${JAVA_HOME:+${JAVA_HOME}/bin/}java"
+java_major="$("${java_command}" -XshowSettings:properties -version 2>&1 |
+    awk -F'= ' '/java.specification.version =/ { print $2; exit }')"
+if [[ "${java_major}" != 17 ]]; then
+    echo "Set JAVA_HOME to JDK 17 for the pinned KSP build and Android fixture." >&2
+    exit 1
+fi
+sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+if [[ ! -d "${sdk_root}/platforms/android-36" ]]; then
+    echo "Set ANDROID_SDK_ROOT or ANDROID_HOME to an SDK with Platform 36 and Build Tools 36.0.0." >&2
+    exit 1
+fi
+export ANDROID_SDK_ROOT="${sdk_root}"
+export PATH="${JAVA_HOME:+${JAVA_HOME}/bin:}${PATH}"
+
+if [[ "${run_device_tests}" == true ]]; then
+    adb="${sdk_root}/platform-tools/adb"
+    device_list="$("${adb}" devices)"
+    serial="$(awk 'NR > 1 && $2 == "device" { print $1 }' <<< "${device_list}")"
+    if [[ "$(awk 'NR > 1 && NF { count++ } END { print count+0 }' <<< "${device_list}")" != 1 \
+            || "${serial}" != emulator-* ]]; then
+        echo "Connect exactly one booted emulator for the KSP consumer tests." >&2
+        exit 1
+    fi
+    if [[ -n "${ANDROID_SERIAL:-}" && "${ANDROID_SERIAL}" != "${serial}" ]]; then
+        echo "ANDROID_SERIAL does not match the KSP test emulator." >&2
+        exit 1
+    fi
+    export ANDROID_SERIAL="${serial}"
+    if [[ "$("${adb}" shell getprop sys.boot_completed | tr -d '\r')" != 1 ]]; then
+        echo "The KSP test emulator has not finished booting." >&2
+        exit 1
+    fi
+    api_level="$("${adb}" shell getprop ro.build.version.sdk | tr -d '\r')"
+    if [[ ! "${api_level}" =~ ^[0-9]+$ || "${api_level}" -lt 21 ]]; then
+        echo "The KSP consumer fixture requires an API 21 or newer emulator." >&2
+        exit 1
+    fi
+fi
+
+report_root="${repo_root}/build/reports/ksp-consumer"
+mkdir -p "${report_root}"
+test_root="$(mktemp -d "${report_root}/run.XXXXXX")"
+echo "KSP verification artifacts: ${test_root}"
+trap 'echo "Preserved KSP verification artifacts at ${test_root}."' EXIT
+project_dir="${test_root}/project"
+mkdir -p "${project_dir}"
+rsync -a --exclude '.gradle/' --exclude 'build/' "${script_dir}/ksp-fixture/" "${project_dir}/"
+
+compiler_command=("${repo_root}/arouter-compiler-ksp/gradlew"
+    -p "${repo_root}/arouter-compiler-ksp" --no-daemon --console=plain --stacktrace)
+fixture_command=("${repo_root}/arouter-compiler-ksp/gradlew"
+    -p "${project_dir}" --no-daemon --console=plain --stacktrace
+    --configuration-cache --configuration-cache-problems=fail
+    "-Parouter.repository=${local_repository}"
+    "-Parouter.api.version=${api_version}"
+    "-Parouter.compiler.version=${compiler_version}"
+    "-Parouter.register.version=${register_version}"
+    "-Parouter.ksp.compiler.version=${ksp_compiler_version}")
+if [[ -n "${AROUTER_GRADLE_INIT_SCRIPT:-}" ]]; then
+    compiler_command+=(--init-script "${AROUTER_GRADLE_INIT_SCRIPT}")
+    fixture_command+=(--init-script "${AROUTER_GRADLE_INIT_SCRIPT}")
+fi
+
+# Rebuild the processor before consumption: an existing local snapshot is not
+# evidence that the checked-out processor generated the application routes.
+"${compiler_command[@]}" test installLocally | tee "${test_root}/compiler.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/first-build.log"
+grep -F 'Configuration cache entry stored.' "${test_root}/first-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/second-build.log"
+grep -F 'Configuration cache entry reused.' "${test_root}/second-build.log"
+
+verify_registrations() {
+    local variant="$1"
+    local transformed_jar=""
+    local candidate
+    while IFS= read -r candidate; do
+        if jar tf "${candidate}" | grep -Fx 'com/alibaba/android/arouter/core/LogisticsCenter.class' >/dev/null; then
+            transformed_jar="${candidate}"
+            break
+        fi
+    done < <(find "${project_dir}/app/build/intermediates/classes/${variant}" -type f -name '*.jar' | sort)
+    if [[ -z "${transformed_jar}" ]]; then
+        echo "Missing transformed LogisticsCenter for ${variant}." >&2
+        exit 1
+    fi
+    local actual
+    actual="$(javap -classpath "${transformed_jar}" -c -p com.alibaba.android.arouter.core.LogisticsCenter |
+        awk '/^  private static void loadRouterMap\(\);$/ { capture = 1; next }
+            capture && /^  (public|protected|private) / { exit }
+            capture { print }' |
+        grep -F '// String com.alibaba.android.arouter.routes.ARouter$$' |
+        sed 's/^.*\/\/ String //')"
+    local expected
+    expected="$(printf '%s\n' \
+        'com.alibaba.android.arouter.routes.ARouter$$Providers$$aptfeature' \
+        'com.alibaba.android.arouter.routes.ARouter$$Providers$$arouterapi' \
+        'com.alibaba.android.arouter.routes.ARouter$$Providers$$kspapp' \
+        'com.alibaba.android.arouter.routes.ARouter$$Root$$aptfeature' \
+        'com.alibaba.android.arouter.routes.ARouter$$Root$$arouterapi' \
+        'com.alibaba.android.arouter.routes.ARouter$$Root$$kspapp')"
+    if [[ "${actual}" != "${expected}" ]]; then
+        echo "Unexpected APT/KSP route registrations for ${variant}:" >&2
+        echo "${actual}" >&2
+        exit 1
+    fi
+}
+verify_registrations debug
+verify_registrations release
+
+# A real source edit must update both variant tables without retaining the old
+# path. The fixture copy is isolated; the checked-in sample is never modified.
+perl -pi -e 's#/ksp/java"#/ksp/java-updated"#g' \
+    "${project_dir}/app/src/main/java/com/alibaba/android/arouter/kspfixture/JavaActivity.java" \
+    "${project_dir}/app/src/main/java/com/alibaba/android/arouter/kspfixture/ProbeActivity.java"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/incremental-build.log"
+grep -F 'Configuration cache entry reused.' "${test_root}/incremental-build.log"
+for variant in debug release; do
+    generated_group="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes/ARouter\$\$Group\$\$ksp.java"
+    test -s "${generated_group}"
+    grep -F '"/ksp/java-updated"' "${generated_group}"
+    if grep -Fq '"/ksp/java"' "${generated_group}"; then
+        echo "Stale route remains in ${variant} after source edit." >&2
+        exit 1
+    fi
+    verify_registrations "${variant}"
+    test -s "${project_dir}/app/build/outputs/apk/${variant}/app-${variant}.apk"
+done
+test -s "${project_dir}/app/build/outputs/mapping/release/mapping.txt"
+
+# Aggregating outputs must account for files added after the first build and
+# remove the last route in a group. Preserve the removed input as test evidence.
+added_source="${project_dir}/app/src/main/kotlin/com/alibaba/android/arouter/kspfixture/AddedFragment.kt"
+cat > "${added_source}" <<'KOTLIN'
+package com.alibaba.android.arouter.kspfixture
+
+@com.alibaba.android.arouter.facade.annotation.Route(path = "/addition/fragment")
+class AddedFragment : androidx.fragment.app.Fragment()
+KOTLIN
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/added-route-build.log"
+grep -F 'Configuration cache entry reused.' "${test_root}/added-route-build.log"
+for variant in debug release; do
+    generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
+    grep -F '"/addition/fragment"' "${generated_dir}/ARouter\$\$Group\$\$addition.java"
+    grep -F '"addition"' "${generated_dir}/ARouter\$\$Root\$\$kspapp.java"
+done
+mv "${added_source}" "${test_root}/removed-AddedFragment.kt"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/removed-route-build.log"
+grep -F 'Configuration cache entry reused.' "${test_root}/removed-route-build.log"
+for variant in debug release; do
+    generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
+    test -s "${generated_dir}/ARouter\$\$Root\$\$kspapp.java"
+    if [[ -e "${generated_dir}/ARouter\$\$Group\$\$addition.java" ]] \
+            || grep -Fq '"addition"' "${generated_dir}/ARouter\$\$Root\$\$kspapp.java"; then
+        echo "Deleted route group remains in ${variant} outputs." >&2
+        exit 1
+    fi
+    verify_registrations "${variant}"
+done
+
+# Remove every route annotation while keeping classes referenced by the app in
+# place. The processor must replace its last aggregate maps with empty maps.
+saved_sources="${test_root}/annotated-sources"
+annotation_count=0
+while IFS= read -r -d '' route_source; do
+    if ! grep -Eq '^[[:space:]]*@Route\(' "${route_source}"; then continue; fi
+    relative_source="${route_source#${project_dir}/}"
+    saved_source="${saved_sources}/${relative_source}"
+    mkdir -p "$(dirname "${saved_source}")"
+    cp -p "${route_source}" "${saved_source}"
+    sed '/^[[:space:]]*@Route[(]/d' "${route_source}" > "${route_source}.no-routes"
+    mv "${route_source}.no-routes" "${route_source}"
+    annotation_count=$((annotation_count + 1))
+done < <(find "${project_dir}/app/src/main" -type f \( -name '*.java' -o -name '*.kt' \) -print0)
+if [[ "${annotation_count}" != 5 ]]; then
+    echo "Expected to remove all five KSP fixture route annotations, found ${annotation_count}." >&2
+    exit 1
+fi
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/empty-module-build.log"
+grep -F 'Configuration cache entry reused.' "${test_root}/empty-module-build.log"
+for variant in debug release; do
+    generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
+    for table in Root Providers; do
+        generated_table="${generated_dir}/ARouter\$\$${table}\$\$kspapp.java"
+        test -s "${generated_table}"
+        if grep -Eq '(routes|providers)\.put\(' "${generated_table}"; then
+            echo "Stale ${table} entry remains after deleting the module's final route (${variant})." >&2
+            exit 1
+        fi
+    done
+    if find "${generated_dir}" -type f -name 'ARouter$$Group$$*.java' | grep . >/dev/null; then
+        echo "Stale KSP group sources remain in the empty module (${variant})." >&2
+        exit 1
+    fi
+    verify_registrations "${variant}"
+done
+# Restore exact bytes before device checks, including the deliberate path edit.
+rsync -a "${saved_sources}/" "${project_dir}/"
+while IFS= read -r -d '' saved_source; do
+    cmp "${saved_source}" "${project_dir}/${saved_source#${saved_sources}/}"
+done < <(find "${saved_sources}" -type f -print0)
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/restored-routes-build.log"
+grep -F 'Configuration cache entry reused.' "${test_root}/restored-routes-build.log"
+for variant in debug release; do
+    generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
+    grep -F '"/ksp/java-updated"' "${generated_dir}/ARouter\$\$Group\$\$ksp.java"
+    grep -F '"ksp"' "${generated_dir}/ARouter\$\$Root\$\$kspapp.java"
+    grep -F '"com.alibaba.android.arouter.kspfixture.KspService"' "${generated_dir}/ARouter\$\$Providers\$\$kspapp.java"
+    verify_registrations "${variant}"
+done
+
+"${fixture_command[@]}" :app:dependencies --configuration debugRuntimeClasspath |
+    tee "${test_root}/runtime-dependencies.log"
+if grep -E 'com.google.devtools.ksp:|com.alibaba:arouter-compiler|com.squareup:javapoet|com.google.code.gson:gson' \
+        "${test_root}/runtime-dependencies.log"; then
+    echo "Compiler dependencies leaked onto the consumer runtime classpath." >&2
+    exit 1
+fi
+
+if [[ "${run_device_tests}" == true ]]; then
+    for test_type in debug release; do
+        if [[ "${test_type}" == debug ]]; then test_variant=Debug; else test_variant=Release; fi
+        marker="$(mktemp "${test_root}/device-${test_type}.XXXXXX")"
+        "${fixture_command[@]}" --no-configuration-cache \
+            "-Parouter.test.build.type=${test_type}" ":app:connected${test_variant}AndroidTest" |
+            tee "${test_root}/device-${test_type}.log"
+        report_count=0
+        while IFS= read -r -d '' report; do
+            if ! grep -Eq '<testsuite .*tests="[1-9][0-9]*"' "${report}" \
+                    || grep -Eq ' (failures|errors|skipped)="[1-9][0-9]*"' "${report}"; then
+                echo "Empty, failed, or skipped KSP device tests in ${report}." >&2
+                exit 1
+            fi
+            report_count=$((report_count + 1))
+        done < <(find "${project_dir}/app/build/outputs/androidTest-results/connected" \
+            -type f -name 'TEST-*.xml' -newer "${marker}" -print0)
+        if [[ "${report_count}" != 1 ]]; then
+            echo "Expected one fresh ${test_type} device report, found ${report_count}." >&2
+            exit 1
+        fi
+    done
+fi
+
+echo 'KSP 2.3.12 / Kotlin 2.3.20 / AGP 9.3.2 consumer verification passed.'

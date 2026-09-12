@@ -1,0 +1,29 @@
+buildscript {
+    def repository = providers.gradleProperty('arouter.repository').get()
+    def registerVersion = providers.gradleProperty('arouter.register.version').get()
+    repositories {
+        maven { url uri(repository) }
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:9.3.2'
+        // AGP 9 supplies Kotlin support. This pins its compiler instead of
+        // applying the incompatible standalone kotlin-android plugin.
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20'
+        classpath 'com.google.devtools.ksp:symbol-processing-gradle-plugin:2.3.12'
+        classpath "com.alibaba:arouter-register:${registerVersion}"
+    }
+}
+
+allprojects {
+    repositories {
+        maven { url uri(rootProject.providers.gradleProperty('arouter.repository').get()) }
+        google()
+        mavenCentral()
+    }
+    configurations.configureEach {
+        // Always consume the freshly staged development processor snapshot.
+        resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+    }
+}
