@@ -33,11 +33,13 @@ final class AutowiredSymbolProcessor implements ManagedSymbolProcessor {
     private static final String PROVIDER = "com.alibaba.android.arouter.facade.template.IProvider";
     private final KSPLogger logger;
     private final AutowiredEmitter emitter;
+    private final ProcessingRound round;
     private final Set<String> generated = new HashSet<>();
     private final Map<String, String> unresolved = new TreeMap<>();
     private boolean failed;
 
-    AutowiredSymbolProcessor(SymbolProcessorEnvironment environment) {
+    AutowiredSymbolProcessor(SymbolProcessorEnvironment environment, ProcessingRound round) {
+        this.round = round;
         logger = environment.getLogger();
         emitter = new AutowiredEmitter(environment.getCodeGenerator());
     }
@@ -117,7 +119,7 @@ final class AutowiredSymbolProcessor implements ManagedSymbolProcessor {
                 validateField(field);
                 KSType canonical = KspTypeNames.canonicalType(field, resolver);
                 TypeName type = KspTypeNames.fieldType(field, canonical, resolver);
-                boolean provider = KspSymbols.hierarchy(canonical).contains(PROVIDER);
+                boolean provider = round.isProvider(canonical);
                 String configuredName = KspSymbols.string(config, "name");
                 fields.add(new AutowiredModel.Field(field.getSimpleName().asString(),
                         configuredName.isEmpty() ? field.getSimpleName().asString() : configuredName,
@@ -133,7 +135,7 @@ final class AutowiredSymbolProcessor implements ManagedSymbolProcessor {
         fields.sort(Comparator.comparing(field -> field.name));
         String bundleSource = null;
         if (needsBundle) {
-            Set<String> hierarchy = KspSymbols.hierarchy(target.asStarProjectedType());
+            Set<String> hierarchy = round.hierarchy(target.asStarProjectedType());
             if (hierarchy.contains("android.app.Activity")) {
                 bundleSource = "ACTIVITY";
             } else if (hierarchy.contains("android.app.Fragment")

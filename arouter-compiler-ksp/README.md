@@ -151,12 +151,15 @@ It refreshes source file handles and validates all generators before emitting
 aggregate tables once in `finish()`. Other KSP processors cannot consume
 these final-round registries during their own processing.
 
-Route and interceptor registries are aggregating. Their dependencies include
-current source roots, favoring correct additions/removals over the narrowest
-possible invalidation. Empty modules emit empty Root/Provider/Interceptor
+Route and interceptor registries are aggregating. Their direct dependencies
+include only the corresponding annotated source files; KSP traces referenced
+parent and field types. Generated injectors are not added as registry origins.
+Empty modules emit empty Root/Provider/Interceptor
 registries. Each injection helper is isolating, with its declaring source as the
 origin; the whole target must resolve before it is emitted. Incremental deletion
-must remove obsolete Group and injector outputs.
+must remove obsolete Group and injector outputs. Inheritance analysis is reused
+only within the current resolver round and is discarded before the next round;
+use-site type arguments are still validated on every lookup.
 
 JavaPoet and Gson are compiler dependencies. KSP API is compile-only and is
 provided by the processing environment. None belongs on the Android application's
@@ -206,4 +209,6 @@ test-only keep rules. Isolated fixture copies and reports are preserved under
 
 The [controlled KAPT/KSP benchmark](BENCHMARK.md) reports scenario-specific
 results and raw-evidence hashes. It found mixed performance, not a universal
-speedup. Release coordinates and remote publication are separate.
+speedup. A subsequent [compile-time optimization](OPTIMIZATION.md) reduced
+selected build costs while retaining byte-identical generated Java.
+Release coordinates and remote publication are separate.

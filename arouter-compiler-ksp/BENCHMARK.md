@@ -69,7 +69,7 @@ See the [fixture and measurement protocol](../gradle/ksp-benchmark-fixture/READM
 The full command, after staging current artifacts and booting one API 34 emulator,
 is:
 
-    python3 gradle/benchmark-ksp.py --routes 128 --iterations 10 --warmups 2 +      --device-tests --expected-api 34 --stop-emulator-after-preflight
+    python3 gradle/benchmark-ksp.py --routes 128 --iterations 10 --warmups 2 --device-tests --expected-api 34 --stop-emulator-after-preflight
 
 The actual run reused the immutable dependency seed from a completed smoke run.
 This affects unmeasured provisioning only. The complete run retained 140 measured

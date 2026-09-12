@@ -90,6 +90,8 @@ def iqr(values):
 class Benchmark:
     def __init__(self, args):
         self.args = args
+        self.backends = ("before", "after") if args.baseline_ksp_from else BACKENDS
+        self.scenarios = tuple(args.scenarios.split(",")) if args.scenarios else SCENARIOS
         self.gradle = cached_gradle(args.gradle)
         java = os.environ.get("JAVA_HOME")
         sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
@@ -109,8 +111,8 @@ class Benchmark:
         self.metrics_script = self.root / "input-tools" / METRICS.name
         self.metrics_script.parent.mkdir()
         shutil.copy2(METRICS, self.metrics_script)
-        self.projects = {backend: self.root / "projects" / backend for backend in BACKENDS}
-        self.homes = {backend: self.root / "gradle-homes" / backend for backend in BACKENDS}
+        self.projects = {backend: self.root / "projects" / backend for backend in self.backends}
+        self.homes = {backend: self.root / "gradle-homes" / backend for backend in self.backends}
         self.seed_home = self.root / "preflight-gradle-home"
         self.ro_cache = self.root / "read-only-dependencies"
         self.owned_homes = [self.seed_home, *self.homes.values()]
@@ -142,7 +144,9 @@ class Benchmark:
             "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
             "run_directory": str(self.root), "platform": platform.platform(), "cpu_count": os.cpu_count(),
             "gradle_executable": str(self.gradle), "routes": args.routes, "iterations": args.iterations,
-            "warmups": args.warmups, "scenarios": list(SCENARIOS),
+            "warmups": args.warmups, "scenarios": list(self.scenarios),
+            "comparison": "KSP before/after" if args.baseline_ksp_from else "KAPT/KSP",
+            "arms": list(self.backends),
             "policy": {
                 "jvm_flags": JVM_FLAGS, "max_workers": 2, "gradle_build_cache": False,
                 "configuration_cache": True, "measured_dependencies": "offline; immutable owned dependency seed",
@@ -161,6 +165,12 @@ class Benchmark:
         write_json(self.root / "samples.json", self.samples)
         write_json(self.root / "commands.json", self.commands)
 
+    def processor_backend(self, arm):
+        return "ksp" if self.args.baseline_ksp_from else arm
+
+    def repository_for(self, arm):
+        return self.root / ("baseline-repository" if arm == "before" else "input-repository")
+
     def home_env(self, home, read_only):
         if not self.marker.is_file() or not inside(home, self.root):
             raise RuntimeError("Refusing to operate on a Gradle home outside this owned run.")
@@ -176,10 +186,12 @@ class Benchmark:
                   "--daemon", "--console=plain", "--max-workers=2", "--no-build-cache",
                   "--configuration-cache" if config_cache else "--no-configuration-cache",
                   "--configuration-cache-problems=fail", "-Dorg.gradle.jvmargs=" + JVM_FLAGS,
-                  "-I", str(self.metrics_script), "-Parouter.benchmark.backend=" + backend]
+                  "-I", str(self.metrics_script), "-Parouter.benchmark.backend=" + self.processor_backend(backend)]
         if offline:
             result.append("--offline")
         for key, value in self.properties.items():
+            if key == "arouter.repository":
+                value = str(self.repository_for(backend))
             result.append("-P" + key + "=" + value)
         return result + list(tasks)
 
@@ -221,7 +233,7 @@ class Benchmark:
                 raise RuntimeError("Task metrics predate the measured invocation: " + stem)
             self.last_invocation[backend] = invocation
             states = {task["path"]: task for task in metrics["tasks"]}
-            frontends = [":app:kaptGenerateStubsDebugKotlin", ":app:kaptDebugKotlin"] if backend == "kapt" \
+            frontends = [":app:kaptGenerateStubsDebugKotlin", ":app:kaptDebugKotlin"] if self.processor_backend(backend) == "kapt" \
                 else [":app:kspDebugKotlin"]
             required = [":app:assembleDebug", ":app:compileDebugKotlin", *frontends]
             if not all(name in states for name in required):
@@ -267,7 +279,7 @@ class Benchmark:
                 raise RuntimeError("Compiled method body did not match the measured mutation.")
         if scenario not in ("route_edit", "add_route", "remove_route"):
             return
-        processing = ":app:kaptDebugKotlin" if backend == "kapt" else ":app:kspDebugKotlin"
+        processing = ":app:kaptDebugKotlin" if self.processor_backend(backend) == "kapt" else ":app:kspDebugKotlin"
         if states[processing].get("outcome") != "executed":
             raise RuntimeError("A route mutation did not execute annotation processing.")
         generated = project / "app/build/generated"
@@ -317,6 +329,17 @@ class Benchmark:
         self.record["input_artifact_hashes"] = {
             p.relative_to(frozen).as_posix(): sha(p) for p in sorted(frozen.rglob("*")) if p.is_file()
         }
+        if self.args.baseline_ksp_from:
+            prior = Path(self.args.baseline_ksp_from).expanduser().resolve()
+            previous = read_json(prior / "run.json")
+            if not (prior / ".arouter-benchmark-owned").is_file() or previous.get("status") != "complete":
+                raise RuntimeError("The KSP baseline must be a completed owned benchmark.")
+            baseline = self.root / "baseline-repository"
+            shutil.copytree(prior / "input-repository", baseline)
+            for relative, digest in previous["input_artifact_hashes"].items():
+                if sha(baseline / relative) != digest:
+                    raise RuntimeError("Baseline artifact changed: " + relative)
+            self.record["baseline"] = {"run": str(prior), "artifact_hashes": previous["input_artifact_hashes"]}
         for directory, dirs, files in os.walk(frozen, topdown=False):
             for name in files:
                 (Path(directory) / name).chmod(0o444)
@@ -388,16 +411,17 @@ class Benchmark:
     def verify_fingerprint(self, backend):
         source = self.projects[backend] / "build/reports/benchmark-fingerprint.json"
         fingerprint = read_json(source)
-        expected = {"backend": backend, "gradle": "8.13", "agp": "8.12.0",
+        actual_backend = self.processor_backend(backend)
+        expected = {"backend": actual_backend, "gradle": "8.13", "agp": "8.12.0",
                     "kotlinGradlePlugin": "2.3.20", "javaSpecificationVersion": "17",
                     "javaTarget": "1.8", "kotlinTarget": "1.8", "languageVersion": "2.3",
                     "apiVersion": "2.3", "executionStrategy": "in-process"}
         for key, value in expected.items():
             if str(fingerprint.get(key)) != value:
                 raise RuntimeError("Unexpected benchmark %s for %s: %r" % (key, backend, fingerprint.get(key)))
-        if backend == "ksp" and fingerprint.get("kspGradlePlugin") != "2.3.12":
+        if actual_backend == "ksp" and fingerprint.get("kspGradlePlugin") != "2.3.12":
             raise RuntimeError("Unexpected KSP version.")
-        if backend == "kapt":
+        if actual_backend == "kapt":
             if fingerprint.get("includeCompileClasspath") is not False:
                 raise RuntimeError("KAPT must not discover processors on the compile classpath.")
             stub = fingerprint.get("stubOptions", {})
@@ -411,19 +435,20 @@ class Benchmark:
     def assert_common_artifacts(self):
         for category in ("runtimeClasspath", "registerClasspath", "compilerClasspath"):
             identities = []
-            for backend in BACKENDS:
+            for backend in self.backends:
                 entries = self.fingerprints[backend].get(category)
                 if not entries:
                     raise RuntimeError("Missing common artifact evidence: " + category)
                 identities.append(sorted((entry["coordinates"], entry["sha256"]) for entry in entries))
             if identities[0] != identities[1]:
                 raise RuntimeError("Benchmark arms have different common dependencies: " + category)
-        for backend, module in (("kapt", "arouter-compiler"), ("ksp", "arouter-compiler-ksp")):
+        for backend in self.backends:
+            module = "arouter-compiler" if self.processor_backend(backend) == "kapt" else "arouter-compiler-ksp"
             entries = self.fingerprints[backend]["processorClasspath"]
             coordinate = "com.alibaba:" + module + ":" + version(module)
             matches = [entry for entry in entries if entry.get("coordinates") == coordinate]
             selected = version(module)
-            directory = self.root / "input-repository/com/alibaba" / module / selected
+            directory = self.repository_for(backend) / "com/alibaba" / module / selected
             artifact_version = selected
             if selected.endswith("-SNAPSHOT"):
                 metadata = ET.parse(directory / "maven-metadata.xml").getroot()
@@ -449,7 +474,7 @@ class Benchmark:
         if api != str(self.args.expected_api):
             raise RuntimeError("Benchmark emulator API mismatch: " + api)
         self.env["ANDROID_SERIAL"] = serial
-        for backend in BACKENDS:
+        for backend in self.backends:
             before = time.time()
             self.invoke(backend, [":app:connectedDebugAndroidTest"], "device-preflight",
                         home=self.seed_home, offline=False, config_cache=False)
@@ -493,7 +518,7 @@ class Benchmark:
         subprocess.run([sys.executable, str(FIXTURE / "generate_sources.py"), "--output", str(base),
                         "--routes", str(self.args.routes)], check=True, env=self.env)
         self.input_manifest = read_json(base / "benchmark-inputs.json")
-        for backend in BACKENDS:
+        for backend in self.backends:
             shutil.copytree(base, self.projects[backend])
         self.base_sources = source_hashes(base)
         self.record["base_sources"] = self.base_sources
@@ -533,7 +558,7 @@ class Benchmark:
             details = self.copy_dependency_tree(seed, self.seed_home / "caches/modules-2", read_only=False)
             self.record["seed_reuse"] = {"previous_run": str(prior), **details}
         self.persist()
-        for backend in BACKENDS:
+        for backend in self.backends:
             self.invoke(backend, ["benchmarkFingerprint", ":app:assembleDebug"], "online-preflight",
                         home=self.seed_home, offline=False, config_cache=False)
             self.verify_fingerprint(backend)
@@ -544,7 +569,7 @@ class Benchmark:
             self.record["device_preflight"] = "not requested; this run alone does not establish runtime parity"
         self.stop_home(self.seed_home)
         self.snapshot_dependencies()
-        for backend in BACKENDS:
+        for backend in self.backends:
             self.invoke(backend, ["benchmarkFingerprint", ":app:assembleDebug"], "offline-private-home-preflight",
                         offline=True, config_cache=False)
             self.verify_fingerprint(backend)
@@ -579,22 +604,39 @@ class Benchmark:
         path.write_text(content.replace(previous, desired, 1), encoding="utf-8")
 
     def assert_source_parity(self):
-        left = source_hashes(self.projects["kapt"])
-        right = source_hashes(self.projects["ksp"])
+        left = source_hashes(self.projects[self.backends[0]])
+        right = source_hashes(self.projects[self.backends[1]])
         if left != right:
             raise RuntimeError("The measured arms no longer have identical application source bytes.")
         return combined_hash(left)
 
+    def assert_generated_parity(self):
+        if not self.args.baseline_ksp_from:
+            return
+        trees = []
+        for arm in self.backends:
+            directory = self.projects[arm] / "app/build/generated/ksp/debug/java"
+            tree = {p.relative_to(directory).as_posix(): sha(p)
+                    for p in sorted(directory.rglob("*.java"))}
+            if not tree:
+                raise RuntimeError("Missing generated Java for the KSP revision comparison.")
+            trees.append(tree)
+        if trees[0] != trees[1]:
+            raise RuntimeError("The optimization changed generated Java; runtime parity is unproven.")
+        self.record["identical_generated_java"] = trees[0]
+
     def measure(self):
         rounds = self.args.warmups + self.args.iterations
         for scenario in ("cold_clean", "warm_clean", "noop", "body_edit", "route_edit"):
+            if scenario not in self.scenarios:
+                continue
             mutation = {"body_edit": "body", "route_edit": "route"}.get(scenario)
             alternate = False
             for index in range(rounds):
-                order = BACKENDS if index % 2 == 0 else tuple(reversed(BACKENDS))
+                order = self.backends if index % 2 == 0 else tuple(reversed(self.backends))
                 if mutation:
                     alternate = not alternate
-                    for backend in BACKENDS:
+                    for backend in self.backends:
                         self.mutate(backend, mutation, alternate)
                 digest = self.assert_source_parity()
                 for backend in order:
@@ -608,14 +650,14 @@ class Benchmark:
                     if self.samples[-1]["source_digest"] != digest:
                         raise RuntimeError("Source changed during a measurement.")
             if mutation and alternate:
-                for backend in BACKENDS:
+                for backend in self.backends:
                     self.mutate(backend, mutation, False)
                     self.invoke(backend, [":app:assembleDebug"], scenario + "-restore")
         # Add and remove form one measured cycle, avoiding hidden reset builds.
-        for index in range(rounds):
-            order = BACKENDS if index % 2 == 0 else tuple(reversed(BACKENDS))
+        for index in range(rounds if "add_route" in self.scenarios else 0):
+            order = self.backends if index % 2 == 0 else tuple(reversed(self.backends))
             for scenario, present, arms in (("add_route", True, order), ("remove_route", False, tuple(reversed(order)))):
-                for backend in BACKENDS:
+                for backend in self.backends:
                     self.mutate(backend, "addition", present)
                 digest = self.assert_source_parity()
                 for backend in arms:
@@ -626,12 +668,15 @@ class Benchmark:
                         raise RuntimeError("Source changed during an add/remove measurement.")
         if self.assert_source_parity() != self.record["base_source_digest"]:
             raise RuntimeError("Benchmark did not restore its original source inputs.")
+        self.assert_generated_parity()
 
     def summarize(self):
         rows = []
-        for scenario in SCENARIOS:
+        baseline, candidate = self.backends
+        ratio_key = "median_paired_after_over_before" if self.args.baseline_ksp_from else "median_paired_ksp_over_kapt"
+        for scenario in self.scenarios:
             arms = {}
-            for backend in BACKENDS:
+            for backend in self.backends:
                 samples = [s for s in self.samples if s["scenario"] == scenario and s["backend"] == backend and not s["warmup"]]
                 if len(samples) != self.args.iterations:
                     raise RuntimeError("Incomplete measured sample set.")
@@ -644,23 +689,24 @@ class Benchmark:
                     pairs.setdefault(sample["sample_index"], {})[sample["backend"]] = sample
             ratios = []
             for pair in pairs.values():
-                if pair["kapt"]["source_digest"] != pair["ksp"]["source_digest"]:
+                if pair[baseline]["source_digest"] != pair[candidate]["source_digest"]:
                     raise RuntimeError("Paired inputs differ.")
-                ratios.append(pair["ksp"]["wall_seconds"] / pair["kapt"]["wall_seconds"])
-            rows.append({"scenario": scenario, **arms, "median_paired_ksp_over_kapt": statistics.median(ratios),
+                ratios.append(pair[candidate]["wall_seconds"] / pair[baseline]["wall_seconds"])
+            rows.append({"scenario": scenario, **arms, ratio_key: statistics.median(ratios),
                          "paired_ratio_iqr": iqr(ratios)})
         write_json(self.root / "summary.json", rows)
-        lines = ["# Controlled ARouter KAPT / KSP benchmark", "",
+        labels = ("Before KSP", "After KSP") if self.args.baseline_ksp_from else ("KAPT", "KSP")
+        lines = ["# Controlled ARouter " + self.record["comparison"] + " benchmark", "",
                  "Same generated application source, AGP 8.12.0 / Gradle 8.13 / Kotlin 2.3.20 / JDK 17.",
                  "Kotlin runs in-process in both arms; dependencies are warm and offline; build cache is disabled.",
                  "Configuration cache is enabled. Cold means a new owned Gradle process, not a cold OS or dependency cache.",
-                 "", "| Scenario | KAPT median / IQR (s) | KSP median / IQR (s) | Median paired KSP/KAPT |",
+                 "", "| Scenario | " + labels[0] + " median / IQR (s) | " + labels[1] + " median / IQR (s) | Median paired candidate/baseline |",
                  "| --- | ---: | ---: | ---: |"]
         for row in rows:
             lines.append("| %s | %.3f / %.3f | %.3f / %.3f | %.3f |" % (
-                row["scenario"], row["kapt"]["median_seconds"], row["kapt"]["iqr_seconds"],
-                row["ksp"]["median_seconds"], row["ksp"]["iqr_seconds"], row["median_paired_ksp_over_kapt"]))
-        lines += ["", "A ratio below 1 means KSP was faster in this fixture. These results are not an ecosystem-wide speed guarantee.",
+                row["scenario"], row[baseline]["median_seconds"], row[baseline]["iqr_seconds"],
+                row[candidate]["median_seconds"], row[candidate]["iqr_seconds"], row[ratio_key]))
+        lines += ["", "A ratio below 1 means the candidate was faster in this fixture. These results are not an ecosystem-wide speed guarantee.",
                   "Provisioning, publication, cleanup and device tests are excluded. Raw commands, samples, task events and fingerprints are retained alongside this report.",
                   "Task intervals can overlap; their durations must not be added and presented as CLI wall time.", ""]
         (self.root / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
@@ -714,6 +760,8 @@ def main():
     parser.add_argument("--copy-cache", action="store_true", help="Allow full copying of the owned dependency seed when COW is unavailable")
     parser.add_argument("--seed-from", help="Clone the immutable dependency seed from a completed owned benchmark run")
     parser.add_argument("--recover-preflight-cache", help="Recover public dependencies from a failed, cleaned-up owned preflight")
+    parser.add_argument("--baseline-ksp-from", help="Compare the frozen KSP artifact in a completed run against the current KSP artifact")
+    parser.add_argument("--scenarios", help="Comma-separated scenarios; route addition/removal must be selected together")
     args = parser.parse_args()
     if args.iterations < 2 or args.warmups < 1 or args.routes < 4 or args.routes % 2:
         parser.error("Use at least two measured iterations, one warmup, and an even route count of at least four.")
@@ -721,6 +769,12 @@ def main():
         parser.error("--stop-emulator-after-preflight requires --device-tests.")
     if args.seed_from and args.recover_preflight_cache:
         parser.error("Choose either --seed-from or --recover-preflight-cache.")
+    if args.scenarios:
+        selected = args.scenarios.split(",")
+        if len(selected) != len(set(selected)) or any(s not in SCENARIOS for s in selected):
+            parser.error("Select distinct known scenarios.")
+        if ("add_route" in selected) != ("remove_route" in selected):
+            parser.error("Select add_route and remove_route together.")
     Benchmark(args).run()
 
 

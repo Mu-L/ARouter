@@ -9,7 +9,6 @@ import com.google.devtools.ksp.symbol.ClassKind;
 import com.google.devtools.ksp.symbol.KSAnnotated;
 import com.google.devtools.ksp.symbol.KSClassDeclaration;
 import com.google.devtools.ksp.symbol.KSDeclaration;
-import com.google.devtools.ksp.symbol.KSFile;
 import com.google.devtools.ksp.symbol.KSFunctionDeclaration;
 import com.google.devtools.ksp.symbol.KSNode;
 import com.google.devtools.ksp.symbol.KSTypeReference;
@@ -35,12 +34,14 @@ final class InterceptorSymbolProcessor implements ManagedSymbolProcessor {
     private final String module;
     private final Map<String, InterceptorModel> models = new TreeMap<>();
     private final Map<String, String> unresolved = new TreeMap<>();
-    private List<KSFile> finalRoundFiles = Collections.emptyList();
+    private final ProcessingRound round;
+    private final java.util.Set<String> originPaths = new java.util.TreeSet<>();
     private List<InterceptorModel> ordered = Collections.emptyList();
     private boolean failed;
     private boolean prepared;
 
-    InterceptorSymbolProcessor(SymbolProcessorEnvironment environment) {
+    InterceptorSymbolProcessor(SymbolProcessorEnvironment environment, ProcessingRound round) {
+        this.round = round;
         logger = environment.getLogger();
         emitter = new InterceptorEmitter(environment.getCodeGenerator());
         String configured = environment.getOptions().get("AROUTER_MODULE_NAME");
@@ -51,10 +52,6 @@ final class InterceptorSymbolProcessor implements ManagedSymbolProcessor {
 
     @Override
     public List<KSAnnotated> process(Resolver resolver) {
-        List<KSFile> files = new ArrayList<>();
-        Iterator<KSFile> all = resolver.getAllFiles().iterator();
-        while (all.hasNext()) { files.add(all.next()); }
-        finalRoundFiles = files;
         List<KSAnnotated> deferred = new ArrayList<>();
         Iterator<KSAnnotated> symbols = resolver.getSymbolsWithAnnotation(ANNOTATION, false).iterator();
         while (symbols.hasNext()) {
@@ -74,7 +71,10 @@ final class InterceptorSymbolProcessor implements ManagedSymbolProcessor {
             try {
                 InterceptorModel model = parse(declaration);
                 unresolved.remove(name);
-                if (model != null) { models.put(name, model); }
+                if (model != null) {
+                    models.put(name, model);
+                    originPaths.add(declaration.getContainingFile().getFilePath());
+                }
             } catch (KspSymbols.UnresolvedType exception) {
                 unresolved.put(name, exception.getMessage());
                 deferred.add(declaration);
@@ -173,7 +173,7 @@ final class InterceptorSymbolProcessor implements ManagedSymbolProcessor {
     public void emitFinish() {
         if (!prepared || failed) { return; }
         try {
-            emitter.emit(module, ordered, new Dependencies(true, finalRoundFiles.toArray(new KSFile[0])));
+            emitter.emit(module, ordered, new Dependencies(true, round.origins(originPaths)));
         } catch (IOException exception) {
             error("Could not generate interceptor registry: " + exception.getMessage()
                     + ". Use only one ARouter processor backend per module.", null);

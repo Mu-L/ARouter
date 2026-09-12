@@ -15,13 +15,14 @@ import java.util.Set;
 /** Coordinates error handling and round completion across ARouter generators. */
 final class ARouterSymbolProcessor implements SymbolProcessor {
     private final List<ManagedSymbolProcessor> processors;
+    private final ProcessingRound round = new ProcessingRound();
     private boolean failed;
 
     ARouterSymbolProcessor(SymbolProcessorEnvironment environment) {
         processors = Arrays.asList(
-                new RouteSymbolProcessor(environment),
-                new AutowiredSymbolProcessor(environment),
-                new InterceptorSymbolProcessor(environment));
+                new RouteSymbolProcessor(environment, round),
+                new AutowiredSymbolProcessor(environment, round),
+                new InterceptorSymbolProcessor(environment, round));
     }
 
     @Override
@@ -30,15 +31,20 @@ final class ARouterSymbolProcessor implements SymbolProcessor {
             onError();
             return Collections.emptyList();
         }
-        Set<KSAnnotated> deferred = new LinkedHashSet<>();
-        for (ManagedSymbolProcessor processor : processors) {
-            deferred.addAll(processor.process(resolver));
-            if (processor.hasErrors()) {
-                onError();
-                return Collections.emptyList();
+        round.begin(resolver);
+        try {
+            Set<KSAnnotated> deferred = new LinkedHashSet<>();
+            for (ManagedSymbolProcessor processor : processors) {
+                deferred.addAll(processor.process(resolver));
+                if (processor.hasErrors()) {
+                    onError();
+                    return Collections.emptyList();
+                }
             }
+            return new ArrayList<>(deferred);
+        } finally {
+            round.endAnalysis();
         }
-        return new ArrayList<>(deferred);
     }
 
     @Override
@@ -61,6 +67,7 @@ final class ARouterSymbolProcessor implements SymbolProcessor {
                 return;
             }
         }
+        round.clear();
     }
 
     private boolean hasErrors() {
@@ -78,6 +85,7 @@ final class ARouterSymbolProcessor implements SymbolProcessor {
     @Override
     public void onError() {
         failed = true;
+        round.clear();
         for (ManagedSymbolProcessor processor : processors) {
             processor.onError();
         }

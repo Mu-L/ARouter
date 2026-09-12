@@ -8,7 +8,6 @@ import com.google.devtools.ksp.symbol.ClassKind;
 import com.google.devtools.ksp.symbol.KSAnnotated;
 import com.google.devtools.ksp.symbol.KSClassDeclaration;
 import com.google.devtools.ksp.symbol.KSDeclaration;
-import com.google.devtools.ksp.symbol.KSFile;
 import com.google.devtools.ksp.symbol.KSNode;
 import com.google.devtools.ksp.symbol.KSPropertyDeclaration;
 import com.google.devtools.ksp.symbol.KSType;
@@ -29,7 +28,6 @@ import com.alibaba.android.arouter.compiler.ksp.KspSymbols.UnresolvedType;
 import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.annotation;
 import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.binaryName;
 import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.expand;
-import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.hierarchy;
 import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.integer;
 import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.parameterKind;
 import static com.alibaba.android.arouter.compiler.ksp.KspSymbols.qualifiedName;
@@ -47,14 +45,14 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
     private final boolean generateDocs;
     private final Map<String, RouteModel> routesByClass = new TreeMap<>();
     private final Map<String, String> unresolved = new TreeMap<>();
-    // Replaced with this round's files on every process invocation. No resolver or
-    // declaration/type symbol is reused in a subsequent round.
-    private List<KSFile> finalRoundFiles = Collections.emptyList();
+    private final ProcessingRound round;
+    private final Set<String> originPaths = new java.util.TreeSet<>();
     private boolean failed;
     private boolean prepared;
     private List<RouteModel> finalRoutes = Collections.emptyList();
 
-    RouteSymbolProcessor(SymbolProcessorEnvironment environment) {
+    RouteSymbolProcessor(SymbolProcessorEnvironment environment, ProcessingRound round) {
+        this.round = round;
         logger = environment.getLogger();
         emitter = new RouteEmitter(environment.getCodeGenerator());
         String configuredModule = environment.getOptions().get(MODULE_OPTION);
@@ -72,12 +70,6 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
 
     @Override
     public List<KSAnnotated> process(Resolver resolver) {
-        List<KSFile> files = new ArrayList<>();
-        Iterator<KSFile> sourceFiles = resolver.getAllFiles().iterator();
-        while (sourceFiles.hasNext()) {
-            files.add(sourceFiles.next());
-        }
-        finalRoundFiles = files;
         List<KSAnnotated> deferred = new ArrayList<>();
         Iterator<KSAnnotated> symbols = resolver.getSymbolsWithAnnotation(ROUTE, false).iterator();
         while (symbols.hasNext()) {
@@ -104,6 +96,7 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
                 unresolved.remove(name);
                 if (route != null) {
                     routesByClass.put(name, route);
+                    originPaths.add(declaration.getContainingFile().getFilePath());
                 }
             } catch (UnresolvedType unresolvedType) {
                 unresolved.put(name, unresolvedType.getMessage());
@@ -144,11 +137,11 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
             return;
         }
         try {
-            // Every output is aggregating: adding a route can change a group, root,
-            // provider index or JSON document. Include all current source roots so
-            // unrelated-to-annotated source edits and deleting the last route are safe.
+            // Only route declarations are direct roots. Resolved parent/field
+            // types are tracked by KSP; generated injectors and unrelated source
+            // files must not couple every helper to these aggregate tables.
             emitter.emit(module, generateDocs, finalRoutes,
-                    new Dependencies(true, finalRoundFiles.toArray(new KSFile[0])));
+                    new Dependencies(true, round.origins(originPaths)));
         } catch (IOException exception) {
             error("Could not generate route tables: " + exception.getMessage()
                     + ". Run only one ARouter processor backend (KSP or APT/KAPT) per module.", null);
@@ -194,7 +187,7 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
                     + "]: it must form a valid Java identifier in the generated group class.", declaration);
             return null;
         }
-        Set<String> hierarchy = hierarchy(declaration.asStarProjectedType());
+        Set<String> hierarchy = round.hierarchy(declaration.asStarProjectedType());
         String type;
         if (hierarchy.contains("android.app.Activity")) {
             type = "ACTIVITY";
@@ -231,7 +224,7 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
                 prototypes.add(qualifiedName(contract));
                 if (PROVIDER.equals(qualifiedName(contract))) {
                     providerKeys.add(binaryName(declaration));
-                } else if (hierarchy(direct).contains(PROVIDER)) {
+                } else if (round.isProvider(direct)) {
                     // Runtime navigation(Class) uses Class.getName(): erase type arguments
                     // and retain '$' for nested interfaces.
                     providerKeys.add(binaryName(contract));
@@ -261,7 +254,7 @@ final class RouteSymbolProcessor implements ManagedSymbolProcessor {
             }
             KSPropertyDeclaration property = (KSPropertyDeclaration) member;
             KSType type = expand(property.getType().resolve());
-            if (hierarchy(type).contains(PROVIDER)) {
+            if (round.isProvider(type)) {
                 continue;
             }
             String name = string(config, "name");

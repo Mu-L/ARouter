@@ -300,6 +300,41 @@ public class RouteProcessorIntegrationTest {
     }
 
     @Test
+    public void cachedHierarchyStillRejectsUnresolvedUseSiteArguments() throws Exception {
+        javaSource("fixture/Base.java",
+                "package fixture; public class Base<T> extends android.app.Activity {}");
+        javaSource("fixture/Targets.java",
+                "package fixture; public class Targets {"
+                + "@com.alibaba.android.arouter.facade.annotation.Route(path=\"/cache/good\") "
+                + "public static class Good extends Base<String> {}"
+                + "@com.alibaba.android.arouter.facade.annotation.Route(path=\"/cache/bad\") "
+                + "public static class Bad extends Base<missing.Payload> {} }");
+        fails(ksp(model, options("cache"), false), "Cannot resolve types");
+        assertNoRegistry();
+    }
+
+    @Test
+    public void serializableProviderRemainsAProviderDuringFieldClassification() throws Exception {
+        javaSource("fixture/Api.java",
+                "package fixture; public interface Api extends java.io.Serializable,"
+                + "com.alibaba.android.arouter.facade.template.IProvider {}");
+        javaSource("fixture/Holder.java",
+                "package fixture; public class Holder {"
+                + "@com.alibaba.android.arouter.facade.annotation.Autowired public Api service; }");
+        javaSource("fixture/Provider.java",
+                "package fixture; public class Provider implements Api {"
+                + "public void init(android.content.Context context) {} }");
+        succeed(ksp(model, options("cache"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Object service = loader.loadClass("fixture.Provider").getConstructor().newInstance();
+            providerTypes(loader).put(loader.loadClass("fixture.Api"), service);
+            Object target = loader.loadClass("fixture.Holder").getConstructor().newInstance();
+            inject(loader, target);
+            assertTrue(service == field(target, "service"));
+        }
+    }
+
+    @Test
     public void precompiledAutowiredMetadataSurvivesMixedBackendBoundary() throws Exception {
         javaSource("fixture/Page.java",
                 "package fixture; @com.alibaba.android.arouter.facade.annotation.Route(path=\"/inherited/page\") "

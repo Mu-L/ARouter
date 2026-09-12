@@ -366,6 +366,51 @@ for variant in debug release; do
     verify_registrations "${variant}"
 done
 
+# An unannotated ancestor change must invalidate every dependent route even
+# when its analysis was reused within a compiler round.
+dependency_dir="${project_dir}/app/src/main/java/com/alibaba/android/arouter/kspfixture/dependency"
+mkdir -p "${dependency_dir}"
+for source_name in Parent Base First Second; do
+    test ! -e "${dependency_dir}/${source_name}.java"
+done
+cat > "${dependency_dir}/Parent.java" <<'JAVA'
+package com.alibaba.android.arouter.kspfixture.dependency;
+public class Parent extends androidx.fragment.app.Fragment {}
+JAVA
+cat > "${dependency_dir}/Base.java" <<'JAVA'
+package com.alibaba.android.arouter.kspfixture.dependency;
+public class Base extends Parent {
+    @com.alibaba.android.arouter.facade.annotation.Autowired public int sharedData = 1;
+}
+JAVA
+for source_name in First Second; do
+    cat > "${dependency_dir}/${source_name}.java" <<JAVA
+package com.alibaba.android.arouter.kspfixture.dependency;
+@com.alibaba.android.arouter.facade.annotation.Route(path="/dependency/${source_name}")
+public class ${source_name} extends Base {}
+JAVA
+done
+"${fixture_command[@]}" :app:assembleDebug 2>&1 | tee "${test_root}/dependency-initial-build.log"
+dependency_group="${project_dir}/app/build/generated/ksp/debug/java/com/alibaba/android/arouter/routes/ARouter\$\$Group\$\$dependency.java"
+test "$(grep -c 'RouteType.FRAGMENT' "${dependency_group}")" = 2
+test "$(grep -c 'put("sharedData", 3)' "${dependency_group}")" = 2
+perl -pi -e 's/androidx.fragment.app.Fragment/android.app.Activity/' "${dependency_dir}/Parent.java"
+"${fixture_command[@]}" :app:assembleDebug 2>&1 | tee "${test_root}/dependency-parent-build.log"
+test "$(grep -c 'RouteType.ACTIVITY' "${dependency_group}")" = 2
+dependency_helper="${project_dir}/app/build/generated/ksp/debug/java/com/alibaba/android/arouter/kspfixture/dependency/Base\$\$ARouter\$\$Autowired.java"
+grep -F 'substitute.getIntent()' "${dependency_helper}"
+perl -pi -e 's/public int sharedData = 1/public String sharedData = "updated"/' "${dependency_dir}/Base.java"
+"${fixture_command[@]}" :app:assembleDebug 2>&1 | tee "${test_root}/dependency-field-build.log"
+test "$(grep -c 'put("sharedData", 8)' "${dependency_group}")" = 2
+mkdir -p "${test_root}/dependency-sources"
+for source_name in Parent Base First Second; do
+    mv "${dependency_dir}/${source_name}.java" "${test_root}/dependency-sources/"
+done
+"${fixture_command[@]}" :app:assembleDebug 2>&1 | tee "${test_root}/dependency-removed-build.log"
+test ! -e "${dependency_group}"
+test ! -e "${dependency_helper}"
+verify_registrations debug
+
 "${fixture_command[@]}" :app:dependencies --configuration debugRuntimeClasspath 2>&1 |
     tee "${test_root}/runtime-dependencies.log"
 if grep -E 'com.google.devtools.ksp:|com.alibaba:arouter-compiler|com.squareup:javapoet|com.google.code.gson:gson' \

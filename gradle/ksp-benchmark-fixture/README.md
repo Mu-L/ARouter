@@ -17,7 +17,7 @@ once to obtain Gradle 8.13, set JAVA_HOME to JDK 17 and ANDROID_SDK_ROOT:
 
 For a full run with exactly one booted API 34 emulator:
 
-    python3 gradle/benchmark-ksp.py --device-tests --expected-api 34 +      --stop-emulator-after-preflight
+    python3 gradle/benchmark-ksp.py --device-tests --expected-api 34 --stop-emulator-after-preflight
 
 The stop flag explicitly stops that selected emulator after correctness checks,
 before timing. Omit it if the emulator must remain running, and account for its
@@ -28,7 +28,7 @@ The driver discovers the cached Gradle 8.13 executable. Use --gradle to supply a
 explicit executable. A previous completed run's immutable public dependency seed
 can be reused without copying the user's global cache:
 
-    python3 gradle/benchmark-ksp.py --seed-from build/reports/ksp-benchmark/run-EXAMPLE +      --device-tests --stop-emulator-after-preflight
+    python3 gradle/benchmark-ksp.py --seed-from build/reports/ksp-benchmark/run-EXAMPLE --device-tests --stop-emulator-after-preflight
 
 Each run owns separate Gradle homes for KAPT and KSP and a frozen copy of the
 selected local ARouter artifacts. Dependencies are prepared in an owned preflight
@@ -68,3 +68,11 @@ contain medians, IQR and paired KSP/KAPT ratios; samples.json, commands.json,
 task-metrics, fingerprints and logs retain the raw evidence. A small fixture or
 smoke run does not establish an ecosystem-wide speedup. Remote publication and
 deployment are outside this benchmark.
+
+To compare an optimized KSP processor with a previously frozen KSP binary:
+
+    python3 gradle/benchmark-ksp.py --baseline-ksp-from build/reports/ksp-benchmark/run-BASELINE --seed-from build/reports/ksp-benchmark/run-BASELINE --scenarios warm_clean,body_edit,route_edit,add_route,remove_route
+
+This mode uses KSP in both arms, freezes the old and current processor artifacts,
+verifies common dependencies, and requires identical generated Java after source
+restoration. The default KAPT/KSP comparison remains available.

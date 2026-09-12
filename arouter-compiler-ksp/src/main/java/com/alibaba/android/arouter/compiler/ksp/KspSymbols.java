@@ -12,6 +12,21 @@ final class KspSymbols {
     private KspSymbols() { }
 
     static int parameterKind(KSType type, Resolver resolver) {
+        int intrinsic = intrinsicKind(type);
+        if (intrinsic >= 0) {
+            return intrinsic;
+        }
+        if (isAssignableTo(type, "android.os.Parcelable", resolver)) {
+            return 10;
+        }
+        if (isAssignableTo(type, "java.io.Serializable", resolver)) {
+            return 9;
+        }
+        return 11;
+    }
+
+    /** JVM scalars/arrays cannot implement a user-defined provider interface. */
+    static int intrinsicKind(KSType type) {
         String name = qualifiedName(expand(type).getDeclaration());
         if (name != null) {
             switch (name) {
@@ -34,13 +49,7 @@ final class KspSymbols {
                 default: break;
             }
         }
-        if (isAssignableTo(type, "android.os.Parcelable", resolver)) {
-            return 10;
-        }
-        if (isAssignableTo(type, "java.io.Serializable", resolver)) {
-            return 9;
-        }
-        return 11;
+        return -1;
     }
 
     static boolean isAssignableTo(KSType type, String name, Resolver resolver) {
@@ -56,38 +65,6 @@ final class KspSymbols {
             current = current.getParentDeclaration();
         }
         return declaration.getPackageName().asString() + "." + String.join("$", names);
-    }
-
-    static Set<String> hierarchy(KSType type) {
-        Set<String> names = new LinkedHashSet<>();
-        collectHierarchy(type, names, new HashSet<>());
-        return names;
-    }
-
-    static void collectHierarchy(KSType type, Set<String> names, Set<String> visited) {
-        type = expand(type);
-        KSDeclaration declaration = type.getDeclaration();
-        String key = qualifiedName(declaration);
-        if (key == null) {
-            KSDeclaration owner = declaration.getParentDeclaration();
-            key = (owner == null ? "" : qualifiedName(owner)) + ":" + declaration;
-        }
-        if (!visited.add(key)) {
-            return;
-        }
-        names.add(key);
-        if (declaration instanceof KSClassDeclaration) {
-            Iterator<KSTypeReference> supers =
-                    ((KSClassDeclaration) declaration).getSuperTypes().iterator();
-            while (supers.hasNext()) {
-                collectHierarchy(supers.next().resolve(), names, visited);
-            }
-        } else if (declaration instanceof KSTypeParameter) {
-            Iterator<KSTypeReference> bounds = ((KSTypeParameter) declaration).getBounds().iterator();
-            while (bounds.hasNext()) {
-                collectHierarchy(bounds.next().resolve(), names, visited);
-            }
-        }
     }
 
     static KSType expand(KSType type) {
