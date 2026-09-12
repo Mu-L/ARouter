@@ -45,6 +45,13 @@ documented in the compiler README. The JVM fixture's Android stubs establish
 compiler behavior, while the device fixture establishes actual navigation.
 These checks do not establish performance gains or the runtime's minimum Android API.
 
+For a separate controlled performance comparison, see the
+[benchmark protocol](ksp-benchmark-fixture/README.md) and
+[recorded results](../arouter-compiler-ksp/BENCHMARK.md). The driver validates
+identical source/dependency inputs and actual completed work before admitting
+each sample. Performance results are machine- and workload-specific; they are
+not a timing threshold in CI.
+
 ## Complete framework device suite
 
 Use JDK 8 and connect exactly one booted Android emulator. The script rejects

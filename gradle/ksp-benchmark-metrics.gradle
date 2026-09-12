@@ -1,0 +1,142 @@
+import groovy.json.JsonOutput
+import org.gradle.api.Plugin
+import org.gradle.api.Project
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.services.BuildService
+import org.gradle.api.services.BuildServiceParameters
+import org.gradle.build.event.BuildEventsListenerRegistry
+import org.gradle.tooling.events.FinishEvent
+import org.gradle.tooling.events.OperationCompletionListener
+import org.gradle.tooling.events.task.TaskFailureResult
+import org.gradle.tooling.events.task.TaskFinishEvent
+import org.gradle.tooling.events.task.TaskSkippedResult
+import org.gradle.tooling.events.task.TaskSuccessResult
+import org.gradle.util.GradleVersion
+
+import javax.inject.Inject
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+
+// Apply with --init-script to the benchmark build. The output path is constant:
+// changing it per sample would invalidate the configuration cache. The driver
+// archives it after the CLI exits and measures CLI wall time independently.
+abstract class ARouterBenchmarkTaskMetrics
+        implements BuildService<ARouterBenchmarkTaskMetrics.Parameters>,
+        OperationCompletionListener, AutoCloseable {
+    interface Parameters extends BuildServiceParameters {
+        RegularFileProperty getOutputFile()
+    }
+
+    // Service instances are recreated for each invocation, including when the
+    // configuration cache is reused. Keep dynamic data out of service parameters.
+    private final String invocationId = UUID.randomUUID().toString()
+    private final long serviceStartedAt = System.currentTimeMillis()
+    private final List<Map<String, Object>> taskResults = new ArrayList<>()
+    private boolean closed
+
+    @Override
+    synchronized void onFinish(FinishEvent event) {
+        if (!(event instanceof TaskFinishEvent)) {
+            return
+        }
+        if (closed) {
+            throw new IllegalStateException('A task event arrived after benchmark metrics were closed.')
+        }
+        def result = ((TaskFinishEvent) event).result
+        boolean upToDate = false
+        boolean fromCache = false
+        String outcome
+        String skipMessage = null
+        if (result instanceof TaskSuccessResult) {
+            upToDate = result.upToDate
+            fromCache = result.fromCache
+            outcome = fromCache ? 'from-cache' : (upToDate ? 'up-to-date' : 'executed')
+        } else if (result instanceof TaskSkippedResult) {
+            outcome = 'skipped'
+            skipMessage = result.skipMessage
+        } else if (result instanceof TaskFailureResult) {
+            outcome = 'failed'
+        } else {
+            throw new IllegalStateException("Unsupported task result: ${result.class.name}")
+        }
+        Map<String, Object> row = [
+            path: ((TaskFinishEvent) event).descriptor.taskPath,
+            startTime: result.startTime,
+            endTime: result.endTime,
+            outcome: outcome,
+            upToDate: upToDate,
+            fromCache: fromCache
+        ]
+        if (skipMessage != null) {
+            row.skipMessage = skipMessage
+        }
+        taskResults.add(row)
+    }
+
+    @Override
+    synchronized void close() {
+        if (closed) {
+            return
+        }
+        closed = true
+        List<Map<String, Object>> rows = new ArrayList<>(taskResults)
+        rows.sort { left, right ->
+            int start = Long.compare((long) left.startTime, (long) right.startTime)
+            start != 0 ? start : left.path.toString().compareTo(right.path.toString())
+        }
+        long closedAt = System.currentTimeMillis()
+        Long startTime = rows.isEmpty() ? null : rows.collect { (long) it.startTime }.min()
+        Long endTime = rows.isEmpty() ? null : rows.collect { (long) it.endTime }.max()
+        Map<String, Object> report = [
+            schemaVersion: 1,
+            invocationId: invocationId,
+            startTime: startTime,
+            endTime: endTime,
+            serviceStartedAt: serviceStartedAt,
+            closedAt: closedAt,
+            timingScope: 'Task execution window in epoch milliseconds; task durations can overlap. The driver measures CLI wall time independently.',
+            gradleVersion: GradleVersion.current().version,
+            javaVersion: System.getProperty('java.version'),
+            javaSpecificationVersion: System.getProperty('java.specification.version'),
+            javaVendor: System.getProperty('java.vendor'),
+            tasks: rows
+        ]
+        def destination = parameters.outputFile.get().asFile.toPath()
+        Files.createDirectories(destination.parent)
+        def temporary = Files.createTempFile(destination.parent, '.benchmark-tasks-', '.json.tmp')
+        try {
+            Files.write(temporary, (JsonOutput.prettyPrint(JsonOutput.toJson(report)) + '\n')
+                    .getBytes(StandardCharsets.UTF_8))
+            // Same-directory atomic replacement prevents a partial report from
+            // being mistaken for a completed sample. If unsupported, fail the
+            // build instead of silently degrading the measurement contract.
+            Files.move(temporary, destination,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } finally {
+            Files.deleteIfExists(temporary)
+        }
+    }
+}
+
+abstract class ARouterBenchmarkMetricsPlugin implements Plugin<Project> {
+    @Inject
+    abstract BuildEventsListenerRegistry getEventsListenerRegistry()
+
+    @Override
+    void apply(Project project) {
+        def service = project.gradle.sharedServices.registerIfAbsent(
+                'arouterBenchmarkTaskMetrics', ARouterBenchmarkTaskMetrics) { spec ->
+            spec.parameters.outputFile.set(project.layout.buildDirectory.file('reports/benchmark-tasks.json'))
+        }
+        // Pass the service Provider directly. A mapped/arbitrary Provider is not
+        // a supported listener registration under the configuration cache.
+        eventsListenerRegistry.onTaskCompletion(service)
+    }
+}
+
+// The registration is configured once, then restored by the configuration cache.
+// Task execution itself is observed exclusively through the BuildService API.
+gradle.rootProject { project ->
+    project.pluginManager.apply(ARouterBenchmarkMetricsPlugin)
+}

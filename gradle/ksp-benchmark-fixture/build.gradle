@@ -1,0 +1,229 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
+
+buildscript {
+    def backend = providers.gradleProperty('arouter.benchmark.backend').get()
+    if (!(backend in ['kapt', 'ksp'])) {
+        throw new GradleException('arouter.benchmark.backend must be kapt or ksp')
+    }
+    repositories {
+        maven { url uri(providers.gradleProperty('arouter.repository').get()) }
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.12.0'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20'
+        if (backend == 'ksp') {
+            classpath 'com.google.devtools.ksp:symbol-processing-gradle-plugin:2.3.12'
+        }
+        classpath "com.alibaba:arouter-register:${providers.gradleProperty('arouter.register.version').get()}"
+    }
+}
+
+ext.benchmarkBackend = providers.gradleProperty('arouter.benchmark.backend').get()
+
+allprojects {
+    repositories {
+        maven {
+            url uri(rootProject.providers.gradleProperty('arouter.repository').get())
+            content { includeGroup 'com.alibaba' }
+        }
+        google()
+        mavenCentral()
+    }
+    configurations.configureEach {
+        resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+    }
+}
+
+/**
+ * Artifact hashes are computed only by this explicit preflight task, never
+ * during configuration of the timed assembleDebug builds. No Project objects
+ * are captured by its action, so the task can also use configuration caching.
+ */
+abstract class BenchmarkFingerprint extends DefaultTask {
+    @Input abstract Property<String> getIdentityJson()
+    @Input abstract Property<String> getLocalRepository()
+    @Input abstract Property<String> getProjectDirectory()
+    @InputFiles @PathSensitive(PathSensitivity.NONE)
+    abstract ConfigurableFileCollection getProcessorArtifacts()
+    @InputFiles @PathSensitive(PathSensitivity.NONE)
+    abstract ConfigurableFileCollection getCompilerArtifacts()
+    @InputFiles @PathSensitive(PathSensitivity.NONE)
+    abstract ConfigurableFileCollection getRuntimeArtifacts()
+    @InputFiles @PathSensitive(PathSensitivity.NONE)
+    abstract ConfigurableFileCollection getRegisterArtifacts()
+    @InputFiles @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getInputSources()
+    @OutputFile abstract RegularFileProperty getOutputFile()
+
+    static String digest(File file) {
+        MessageDigest digest = MessageDigest.getInstance('SHA-256')
+        file.withInputStream { input ->
+            byte[] buffer = new byte[16384]
+            int count
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count)
+        }
+        digest.digest().encodeHex().toString()
+    }
+
+    static String coordinates(File file, File repository) {
+        def path = file.canonicalFile.toPath()
+        def local = repository.canonicalFile.toPath()
+        if (path.startsWith(local)) {
+            def parts = local.relativize(path).collect { it.toString() }
+            if (parts.size() >= 4) {
+                return (parts.subList(0, parts.size() - 3).join('.') + ':'
+                        + parts[parts.size() - 3] + ':' + parts[parts.size() - 2]
+                )
+            }
+        }
+        // These are the resolved coordinates encoded by Gradle's Maven cache.
+        def parts = path.collect { it.toString() }
+        int marker = parts.indexOf('files-2.1')
+        if (marker >= 0 && parts.size() > marker + 4) {
+            return parts[marker + 1] + ':' + parts[marker + 2] + ':' + parts[marker + 3]
+        }
+        throw new GradleException("Cannot establish resolved Maven coordinates for ${file}")
+    }
+
+    static List<Map<String, String>> artifacts(Set<File> files, File repository) {
+        files.sort { it.absolutePath }.collect { file ->
+            if (!file.isFile()) throw new GradleException("Expected resolved artifact file: ${file}")
+            [coordinates: BenchmarkFingerprint.coordinates(file, repository), path: file.canonicalPath,
+             sha256: BenchmarkFingerprint.digest(file)]
+        }
+    }
+
+    @TaskAction
+    void writeFingerprint() {
+        def identity = new JsonSlurper().parseText(identityJson.get())
+        File repository = new File(localRepository.get())
+        identity.processorClasspath = artifacts(processorArtifacts.files, repository)
+        identity.compilerClasspath = artifacts(compilerArtifacts.files, repository)
+        identity.runtimeClasspath = artifacts(runtimeArtifacts.files, repository)
+        identity.registerClasspath = artifacts(registerArtifacts.files, repository)
+        def sourceRoot = new File(projectDirectory.get()).toPath()
+        identity.sourceHashes = inputSources.files.sort { it.absolutePath }.collectEntries { file ->
+            [(sourceRoot.relativize(file.toPath()).toString().replace(File.separator, '/')): BenchmarkFingerprint.digest(file)]
+        }
+        File output = outputFile.get().asFile
+        output.parentFile.mkdirs()
+        output.setText(JsonOutput.prettyPrint(JsonOutput.toJson(identity)) + '\n', 'UTF-8')
+        println output.absolutePath
+    }
+}
+
+evaluationDependsOnChildren()
+def app = project(':app')
+def kotlinTask = app.tasks.named('compileDebugKotlin').get()
+def processorTask = app.tasks.named(benchmarkBackend == 'kapt' ? 'kaptDebugKotlin' : 'kspDebugKotlin').get()
+def stubTask = benchmarkBackend == 'kapt' ? app.tasks.named('kaptGenerateStubsDebugKotlin').get() : null
+def compilerOptions = { task ->
+    [
+        task: task.path,
+        implementation: task.class.name,
+        jvmTarget: task.compilerOptions.jvmTarget.get().target,
+        languageVersion: task.compilerOptions.languageVersion.get().version,
+        apiVersion: task.compilerOptions.apiVersion.get().version,
+        freeCompilerArgs: task.compilerOptions.freeCompilerArgs.get(),
+        executionStrategy: task.compilerExecutionStrategy.get().propertyValue
+    ]
+}
+def versions = buildscript.configurations.classpath.incoming.resolutionResult.allComponents
+        .findAll { it.moduleVersion != null }
+        .collectEntries { [(it.moduleVersion.group + ':' + it.moduleVersion.name): it.moduleVersion.version] }
+def fingerprint = [
+    backend: benchmarkBackend,
+    gradle: gradle.gradleVersion,
+    agp: com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION,
+    kotlinGradlePlugin: versions['org.jetbrains.kotlin:kotlin-gradle-plugin'],
+    kspGradlePlugin: versions['com.google.devtools.ksp:symbol-processing-gradle-plugin'],
+    javaVersion: System.getProperty('java.version'),
+    javaSpecificationVersion: System.getProperty('java.specification.version'),
+    javaHome: System.getProperty('java.home'),
+    gradleJvmArgs: providers.gradleProperty('org.gradle.jvmargs').get(),
+    maxWorkers: gradle.startParameter.maxWorkerCount,
+    buildCacheEnabled: gradle.startParameter.buildCacheEnabled,
+    moduleName: 'benchmarkapp',
+    plugins: [
+        kotlinAndroid: app.plugins.hasPlugin('org.jetbrains.kotlin.android'),
+        kapt: app.plugins.hasPlugin('org.jetbrains.kotlin.kapt'),
+        ksp: app.plugins.hasPlugin('com.google.devtools.ksp'),
+        legacyKapt: app.plugins.hasPlugin('com.android.legacy-kapt'),
+        register: app.plugins.hasPlugin('com.alibaba.arouter')
+    ],
+    android: [
+        compileSdk: app.android.compileSdk,
+        buildToolsVersion: app.android.buildToolsVersion,
+        minSdk: app.android.defaultConfig.minSdk,
+        targetSdk: app.android.defaultConfig.targetSdk,
+        javaSource: app.android.compileOptions.sourceCompatibility.toString(),
+        javaTarget: app.android.compileOptions.targetCompatibility.toString()
+    ],
+    kotlinCompile: compilerOptions(kotlinTask),
+    kaptStubs: stubTask == null ? null : compilerOptions(stubTask),
+    kaptIncludeCompileClasspath: benchmarkBackend == 'kapt' ? processorTask.includeCompileClasspath.get() : null,
+    incremental: [
+        kotlin: providers.gradleProperty('kotlin.incremental').get(),
+        kapt: providers.gradleProperty('kapt.incremental.apt').get(),
+        ksp: providers.gradleProperty('ksp.incremental').get()
+    ],
+    processorTask: [path: processorTask.path, implementation: processorTask.class.name]
+]
+fingerprint.javaTarget = fingerprint.android.javaTarget
+fingerprint.kotlinTarget = fingerprint.kotlinCompile.jvmTarget
+fingerprint.languageVersion = fingerprint.kotlinCompile.languageVersion
+fingerprint.apiVersion = fingerprint.kotlinCompile.apiVersion
+fingerprint.executionStrategy = fingerprint.kotlinCompile.executionStrategy
+fingerprint.includeCompileClasspath = fingerprint.kaptIncludeCompileClasspath
+fingerprint.stubOptions = fingerprint.kaptStubs
+if (benchmarkBackend == 'ksp') {
+    fingerprint.kspOptions = [
+        languageVersion: processorTask.kspConfig.languageVersion.get(),
+        apiVersion: processorTask.kspConfig.apiVersion.get(),
+        jvmTarget: processorTask.kspConfig.jvmTarget.get(),
+        processorOptions: processorTask.kspConfig.processorOptions.get()
+    ]
+}
+if (fingerprint.gradle != '8.13' || fingerprint.agp != '8.12.0'
+        || fingerprint.kotlinGradlePlugin != '2.3.20' || fingerprint.javaSpecificationVersion != '17'
+        || (benchmarkBackend == 'ksp' && fingerprint.kspGradlePlugin != '2.3.12')
+        || (benchmarkBackend == 'kapt' && fingerprint.kspGradlePlugin != null)
+        || !fingerprint.plugins.kotlinAndroid || !fingerprint.plugins.register
+        || fingerprint.plugins.legacyKapt || fingerprint.plugins.kapt != (benchmarkBackend == 'kapt')
+        || fingerprint.plugins.ksp != (benchmarkBackend == 'ksp')) {
+    throw new GradleException("Unexpected effective benchmark toolchain: ${fingerprint}")
+}
+[fingerprint.kotlinCompile, fingerprint.kaptStubs].findAll { it != null }.each { options ->
+    if (options.jvmTarget != '1.8' || options.languageVersion != '2.3'
+            || options.apiVersion != '2.3' || options.executionStrategy != 'in-process') {
+        throw new GradleException("Unexpected effective Kotlin compiler options: ${options}")
+    }
+}
+if (benchmarkBackend == 'kapt' && fingerprint.kaptIncludeCompileClasspath != false) {
+    throw new GradleException('KAPT includeCompileClasspath must remain false')
+}
+def compilerClasspathGetter = kotlinTask.class.methods.find {
+    it.name.startsWith('getDefaultCompilerClasspath') && it.parameterCount == 0
+}
+if (compilerClasspathGetter == null) {
+    throw new GradleException('Cannot inspect the pinned Kotlin task compiler classpath')
+}
+def effectiveCompilerClasspath = compilerClasspathGetter.invoke(kotlinTask)
+
+tasks.register('benchmarkFingerprint', BenchmarkFingerprint) {
+    identityJson.set(JsonOutput.toJson(fingerprint))
+    localRepository.set(providers.gradleProperty('arouter.repository'))
+    projectDirectory.set(rootDir.absolutePath)
+    processorArtifacts.from(benchmarkBackend == 'kapt'
+            ? processorTask.kaptClasspath : processorTask.kspConfig.processorClasspath)
+    compilerArtifacts.from(effectiveCompilerClasspath)
+    runtimeArtifacts.from(app.configurations.named('debugRuntimeClasspath'))
+    registerArtifacts.from(buildscript.configurations.classpath.filter { it.name.startsWith('arouter-register-') })
+    inputSources.from(fileTree('app/src') { include '**/*.java', '**/*.kt', '**/AndroidManifest.xml' })
+    outputFile.set(layout.buildDirectory.file('reports/benchmark-fingerprint.json'))
+}

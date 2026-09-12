@@ -204,5 +204,6 @@ injection and inherited/nested helpers. It uses runtime consumer rules without
 test-only keep rules. Isolated fixture copies and reports are preserved under
 `build/reports/ksp-consumer`.
 
-A measured KAPT/KSP build comparison is separate from these correctness checks.
-Release coordinates and remote publication are also separate.
+The [controlled KAPT/KSP benchmark](BENCHMARK.md) reports scenario-specific
+results and raw-evidence hashes. It found mixed performance, not a universal
+speedup. Release coordinates and remote publication are separate.
