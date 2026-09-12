@@ -1,6 +1,5 @@
 package com.alibaba.android.arouter.compiler.ksp;
 
-import com.google.devtools.ksp.UtilsKt;
 import com.google.devtools.ksp.processing.Resolver;
 import com.google.devtools.ksp.symbol.KSClassDeclaration;
 import com.google.devtools.ksp.symbol.KSDeclaration;
@@ -33,10 +32,17 @@ final class KspTypeNames {
             // conversion cannot consume Java flexible/platform types such as String!.
             return original;
         }
+        if (field.getSetter() == null) {
+            throw new KspSymbols.InvalidSymbol("KSP cannot determine the JVM variance of this mutable Kotlin field "
+                    + "because its setter symbol is unavailable. Use a supported mutable @JvmField or lateinit field.");
+        }
         try {
             // KSP performs alias substitution and declaration/use-site wildcard mapping.
             // Expanding alias.declaration.type ourselves would lose applied arguments.
-            KSType canonical = resolver.getJavaWildcard(field.getType()).resolve();
+            // A mutable JVM field uses value-parameter variance, not method-return
+            // variance. The property's synthetic setter parameter selects that mode;
+            // using property.type incorrectly erases stars and nested out projections.
+            KSType canonical = resolver.getJavaWildcard(field.getSetter().getParameter().getType()).resolve();
             KspSymbols.requireResolved(canonical);
             return canonical;
         } catch (IllegalStateException | IllegalArgumentException exception) {
@@ -117,8 +123,19 @@ final class KspTypeNames {
         if (resolver.isJavaRawType(type)) {
             return raw;
         }
+        return declaredType((KSClassDeclaration) declaration, type.getArguments(), resolver, generatedPackage);
+    }
+
+    private static TypeName declaredType(KSClassDeclaration declaration, List<KSTypeArgument> typeArguments,
+            Resolver resolver, String generatedPackage) {
+        ClassName raw = className(declaration, resolver);
+        int ownParameterCount = declaration.getTypeParameters().size();
+        if (typeArguments.size() < ownParameterCount) {
+            throw new KspSymbols.InvalidSymbol("KSP provided incomplete generic arguments for ["
+                    + KspSymbols.qualifiedName(declaration) + "]. Use a concrete field type.");
+        }
         List<TypeName> arguments = new ArrayList<>();
-        for (KSTypeArgument argument : type.getArguments()) {
+        for (KSTypeArgument argument : typeArguments.subList(0, ownParameterCount)) {
             if (argument.getVariance() == Variance.STAR || argument.getType() == null) {
                 arguments.add(WildcardTypeName.subtypeOf(TypeName.OBJECT));
                 continue;
@@ -131,9 +148,18 @@ final class KspTypeNames {
             }
             arguments.add(argumentName);
         }
-        KSType outer = UtilsKt.getOuterType(type);
-        if (outer != null) {
-            TypeName outerName = typeName(outer, resolver, generatedPackage);
+        if (typeArguments.size() > ownParameterCount) {
+            KSDeclaration owner = declaration.getParentDeclaration();
+            if (!(owner instanceof KSClassDeclaration)) {
+                throw new KspSymbols.InvalidSymbol("KSP provided unexpected enclosing generic arguments for ["
+                        + KspSymbols.qualifiedName(declaration) + "].");
+            }
+            // KSP flattens own arguments before enclosing arguments. Render that
+            // owner chain directly: Java owner.asType(tail) rejects outer arguments
+            // for a middle class because KSP does not mark Java members as INNER.
+            // A nongeneric middle class still consumes zero arguments and recurses.
+            TypeName outerName = declaredType((KSClassDeclaration) owner,
+                    typeArguments.subList(ownParameterCount, typeArguments.size()), resolver, generatedPackage);
             if (outerName instanceof ParameterizedTypeName) {
                 return ((ParameterizedTypeName) outerName).nestedClass(
                         declaration.getSimpleName().asString(), arguments);

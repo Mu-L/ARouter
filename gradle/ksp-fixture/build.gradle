@@ -1,24 +1,29 @@
+import groovy.json.JsonOutput
+
 buildscript {
     def repository = providers.gradleProperty('arouter.repository').get()
     def registerVersion = providers.gradleProperty('arouter.register.version').get()
+    def agpVersion = providers.gradleProperty('arouter.agp.version').getOrElse('9.3.2')
     repositories {
         maven { url uri(repository) }
         google()
         mavenCentral()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:9.3.2'
-        // AGP 9 supplies Kotlin support. This pins its compiler instead of
-        // applying the incompatible standalone kotlin-android plugin.
+        classpath "com.android.tools.build:gradle:${agpVersion}"
         classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.20'
         classpath 'com.google.devtools.ksp:symbol-processing-gradle-plugin:2.3.12'
         classpath "com.alibaba:arouter-register:${registerVersion}"
+        if (agpVersion.startsWith('9.')) {
+            // Only AGP 9 loads the plugin implementing com.android.legacy-kapt.
+            // An unconditional apply-false declaration would contaminate AGP 8.
+            classpath "com.android.tools.build:gradle-kotlin:${agpVersion}"
+        }
     }
 }
 
-plugins {
-    id 'com.android.legacy-kapt' version '9.3.2' apply false
-}
+ext.fixtureAgpVersion = providers.gradleProperty('arouter.agp.version').getOrElse('9.3.2')
+ext.fixtureBuiltInKotlin = fixtureAgpVersion.startsWith('9.')
 
 allprojects {
     repositories {
@@ -29,5 +34,66 @@ allprojects {
     configurations.configureEach {
         // Always consume the freshly staged development processor snapshot.
         resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+    }
+}
+
+// This small standalone fixture deliberately configures both modules before
+// recording their effective plugin set. The task action captures only strings
+// and a file, keeping configuration-cache reuse independent of Project objects.
+evaluationDependsOnChildren()
+def expectedGradle = ['8.12.0': '8.13', '9.0.0': '9.1.0', '9.3.2': '9.5.0'][fixtureAgpVersion]
+if (expectedGradle == null) {
+    throw new GradleException("Unsupported KSP fixture AGP row: ${fixtureAgpVersion}")
+}
+def modules = buildscript.configurations.classpath.incoming.resolutionResult.allComponents
+        .findAll { it.moduleVersion != null }
+        .collectEntries { [(it.moduleVersion.group + ':' + it.moduleVersion.name): it.moduleVersion.version] }
+def fingerprint = [
+    gradle: gradle.gradleVersion,
+    agp: com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION,
+    kotlinGradlePlugin: modules['org.jetbrains.kotlin:kotlin-gradle-plugin'],
+    kspGradlePlugin: modules['com.google.devtools.ksp:symbol-processing-gradle-plugin'],
+    javaVersion: System.getProperty('java.version'),
+    javaSpecificationVersion: System.getProperty('java.specification.version'),
+    javaHome: System.getProperty('java.home'),
+    modules: [':app', ':apt-feature'].collectEntries { path ->
+        def child = project(path)
+        def applied = child.plugins
+        [(path): [
+            javaTarget: child.extensions.getByName('android').compileOptions.targetCompatibility.toString(),
+            kotlinTarget: child.extensions.getByName('kotlin').compilerOptions.jvmTarget.get().target,
+            kotlinAndroid: applied.hasPlugin('org.jetbrains.kotlin.android'),
+            kotlinKapt: applied.hasPlugin('org.jetbrains.kotlin.kapt'),
+            legacyKapt: applied.hasPlugin('com.android.legacy-kapt'),
+            ksp: applied.hasPlugin('com.google.devtools.ksp')
+        ]]
+    }
+]
+if (fingerprint.gradle != expectedGradle || fingerprint.agp != fixtureAgpVersion
+        || fingerprint.kotlinGradlePlugin != '2.3.20' || fingerprint.kspGradlePlugin != '2.3.12'
+        || fingerprint.javaSpecificationVersion != '17') {
+    throw new GradleException("Unexpected effective KSP toolchain: ${fingerprint}")
+}
+def appPlugins = fingerprint.modules[':app']
+def legacyPlugins = fingerprint.modules[':apt-feature']
+if (!appPlugins.ksp || appPlugins.kotlinAndroid == fixtureBuiltInKotlin
+        || appPlugins.kotlinKapt || appPlugins.legacyKapt || legacyPlugins.ksp
+        || legacyPlugins.kotlinAndroid == fixtureBuiltInKotlin
+        || legacyPlugins.legacyKapt != fixtureBuiltInKotlin
+        || (!fixtureBuiltInKotlin && !legacyPlugins.kotlinKapt)) {
+    throw new GradleException("Unexpected Kotlin/KAPT/KSP module plugins: ${fingerprint.modules}")
+}
+if (fingerprint.modules.values().any { it.javaTarget != '1.8' || it.kotlinTarget != '1.8' }) {
+    throw new GradleException("Unexpected Java/Kotlin bytecode targets: ${fingerprint.modules}")
+}
+def fingerprintJson = JsonOutput.prettyPrint(JsonOutput.toJson(fingerprint)) + '\n'
+def fingerprintFile = layout.buildDirectory.file('reports/toolchain.json').get().asFile
+tasks.register('verifyToolchain') {
+    inputs.property('fingerprint', fingerprintJson)
+    outputs.file(fingerprintFile)
+    doLast {
+        fingerprintFile.parentFile.mkdirs()
+        fingerprintFile.setText(fingerprintJson, 'UTF-8')
+        println fingerprintJson
     }
 }

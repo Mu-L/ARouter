@@ -485,6 +485,239 @@ public class RouteProcessorIntegrationTest {
     }
 
     @Test
+    public void javaWildcardAndRawCollectionTokensMatchDeclaredFieldTypes() throws Exception {
+        serializationFixture();
+        javaSource("fixture/Payload.java", "package fixture; public class Payload {}");
+        javaSource("fixture/Wildcards.java",
+                "package fixture; import com.alibaba.android.arouter.facade.annotation.Autowired;"
+                + "public class Wildcards extends android.app.Activity {"
+                + "@Autowired public java.util.List<? extends Payload> upper;"
+                + "@Autowired public java.util.List<? super Payload> lower;"
+                + "@Autowired public java.util.List raw; }");
+        succeed(ksp(model, options("wildcards"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Object target = loader.loadClass("fixture.Wildcards").getConstructor().newInstance();
+            Object serializer = serializer(loader);
+            List<Object> parsed = Arrays.asList(loader.loadClass("fixture.Payload").getConstructor().newInstance());
+            serializer.getClass().getField("value").set(serializer, parsed);
+            for (String name : Arrays.asList("upper", "lower", "raw")) {
+                Object bundle = bundle(loader);
+                put(bundle, name, "json-" + name);
+                setExtras(loader, target, bundle);
+                inject(loader, target);
+                assertTrue(name, parsed == field(target, name));
+                assertEquals(name, target.getClass().getField(name).getGenericType(), field(serializer, "lastType"));
+                assertEquals("json-" + name, field(serializer, "lastInput"));
+            }
+            assertEquals(List.class, target.getClass().getField("raw").getGenericType());
+        }
+    }
+
+    @Test
+    public void multidimensionalArraysPreserveJvmComponentTypesAndExplicitNull() throws Exception {
+        javaSource("fixture/Payload.java", "package fixture; public class Payload {}");
+        javaSource("fixture/JavaArrays.java",
+                "package fixture; import com.alibaba.android.arouter.facade.annotation.Autowired;"
+                + "public class JavaArrays extends android.app.Activity {"
+                + "@Autowired public String[][] texts=new String[][]{{\"old\"}};"
+                + "@Autowired public int[][] numbers=new int[][]{{7}}; }");
+        kotlinSource("fixture/KotlinArrays.kt",
+                "package fixture\n"
+                + "import com.alibaba.android.arouter.facade.annotation.Autowired\n"
+                + "class KotlinArrays : androidx.fragment.app.Fragment() {\n"
+                + " @field:Autowired @JvmField var payloads: Array<Array<Payload?>>? = null\n"
+                + " @field:Autowired @JvmField var numbers: Array<IntArray>? = null\n"
+                + "}\n");
+        succeed(ksp(model, options("arrays"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Object javaTarget = loader.loadClass("fixture.JavaArrays").getConstructor().newInstance();
+            Object initialTexts = field(javaTarget, "texts");
+            Object initialNumbers = field(javaTarget, "numbers");
+            inject(loader, javaTarget);
+            assertTrue(initialTexts == field(javaTarget, "texts"));
+            assertTrue(initialNumbers == field(javaTarget, "numbers"));
+            String[][] texts = {{"new"}, null};
+            int[][] numbers = {{3, 5}, {}};
+            Object javaBundle = bundle(loader);
+            put(javaBundle, "texts", texts);
+            put(javaBundle, "numbers", numbers);
+            setExtras(loader, javaTarget, javaBundle);
+            inject(loader, javaTarget);
+            assertTrue(texts == field(javaTarget, "texts"));
+            assertTrue(numbers == field(javaTarget, "numbers"));
+
+            Object kotlinTarget = loader.loadClass("fixture.KotlinArrays").getConstructor().newInstance();
+            Object payloads = java.lang.reflect.Array.newInstance(loader.loadClass("fixture.Payload"), 2, 1);
+            Object kotlinBundle = bundle(loader);
+            put(kotlinBundle, "payloads", payloads);
+            put(kotlinBundle, "numbers", numbers);
+            setExtras(loader, kotlinTarget, kotlinBundle);
+            inject(loader, kotlinTarget);
+            assertEquals(payloads.getClass(), kotlinTarget.getClass().getField("payloads").getType());
+            assertEquals(int[][].class, kotlinTarget.getClass().getField("numbers").getType());
+            assertTrue(payloads == field(kotlinTarget, "payloads"));
+            assertTrue(numbers == field(kotlinTarget, "numbers"));
+            for (String name : Arrays.asList("payloads", "numbers")) put(kotlinBundle, name, null);
+            for (String name : Arrays.asList("texts", "numbers")) put(javaBundle, name, null);
+            inject(loader, kotlinTarget);
+            inject(loader, javaTarget);
+            assertEquals(null, field(kotlinTarget, "payloads"));
+            assertEquals(null, field(kotlinTarget, "numbers"));
+            assertEquals(null, field(javaTarget, "texts"));
+            assertEquals(null, field(javaTarget, "numbers"));
+            assertTrue(logErrors(loader).toString(), logErrors(loader).isEmpty());
+        }
+    }
+
+    @Test
+    public void kotlinStarAndNullableNestedGenericTokensMatchJvmFields() throws Exception {
+        serializationFixture();
+        kotlinSource("fixture/GenericFields.kt",
+                "package fixture\n"
+                + "import com.alibaba.android.arouter.facade.annotation.Autowired\n"
+                + "class Payload\n"
+                + "class GenericFields : android.app.Activity() {\n"
+                + " @field:Autowired @JvmField var star: List<*>? = null\n"
+                + " @field:Autowired @JvmField var nullable: List<Payload?>? = null\n"
+                + " @field:Autowired @JvmField var nested: Map<String, List<Payload?>?>? = null\n"
+                + " @field:Autowired @JvmField @JvmSuppressWildcards var suppressed: Map<String, List<Payload?>>? = null\n"
+                + " @field:Autowired @JvmField var forced: List<@JvmWildcard Payload>? = null\n"
+                + "}\n");
+        succeed(ksp(model, options("nullableGenerics"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Object target = loader.loadClass("fixture.GenericFields").getConstructor().newInstance();
+            Object serializer = serializer(loader);
+            Object payload = loader.loadClass("fixture.Payload").getConstructor().newInstance();
+            List<Object> values = Arrays.asList(payload, null);
+            Map<String, Object> valuesByField = new LinkedHashMap<>();
+            valuesByField.put("star", values);
+            valuesByField.put("nullable", values);
+            valuesByField.put("nested", Collections.singletonMap("items", values));
+            valuesByField.put("suppressed", Collections.singletonMap("items", values));
+            valuesByField.put("forced", values);
+            for (Map.Entry<String, Object> entry : valuesByField.entrySet()) {
+                Object bundle = bundle(loader);
+                put(bundle, entry.getKey(), "json-" + entry.getKey());
+                setExtras(loader, target, bundle);
+                serializer.getClass().getField("value").set(serializer, entry.getValue());
+                inject(loader, target);
+                assertTrue(entry.getKey(), entry.getValue() == field(target, entry.getKey()));
+                assertEquals(entry.getKey(), target.getClass().getField(entry.getKey()).getGenericType(),
+                        field(serializer, "lastType"));
+            }
+        }
+    }
+
+    @Test
+    public void genericProviderInjectionUsesErasedNestedClassKeys() throws Exception {
+        javaSource("fixture/GenericServices.java",
+                "package fixture; import com.alibaba.android.arouter.facade.annotation.Autowired;"
+                + "public class GenericServices {"
+                + "public interface Api<T> extends com.alibaba.android.arouter.facade.template.IProvider {}"
+                + "@com.alibaba.android.arouter.facade.annotation.Route(path=\"/generic/service\") "
+                + "public static class Service implements Api<String> {public void init(android.content.Context c) {}}"
+                + "public static class Holder {"
+                + "@Autowired(required=true) public Api<String> typed;"
+                + "@Autowired(name=\"/generic/service\",required=true) public Api<? extends CharSequence> named;"
+                + "} }");
+        kotlinSource("fixture/KotlinProviderHolder.kt",
+                "package fixture\n"
+                + "class KotlinProviderHolder {\n"
+                + " @field:com.alibaba.android.arouter.facade.annotation.Autowired(required=true)\n"
+                + " @JvmField var typed: GenericServices.Api<String>? = null\n"
+                + "}\n");
+        succeed(ksp(model, options("genericProviders"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Class<?> api = loader.loadClass("fixture.GenericServices$Api");
+            Object service = loader.loadClass("fixture.GenericServices$Service").getConstructor().newInstance();
+            Map<String, Object> registry = providers(loader, "genericProviders");
+            assertEquals(Collections.singleton(api.getName()), registry.keySet());
+            assertEquals(service.getClass().getName(), destination(registry.get(api.getName())));
+            providerTypes(loader).put(api, service);
+            providerPaths(loader).put("/generic/service", service);
+            Object javaTarget = loader.loadClass("fixture.GenericServices$Holder").getConstructor().newInstance();
+            Object kotlinTarget = loader.loadClass("fixture.KotlinProviderHolder").getConstructor().newInstance();
+            inject(loader, javaTarget);
+            inject(loader, kotlinTarget);
+            assertTrue(service == field(javaTarget, "typed"));
+            assertTrue(service == field(javaTarget, "named"));
+            assertTrue(service == field(kotlinTarget, "typed"));
+        }
+    }
+
+    @Test
+    public void parameterizedOuterAndInnerTypesRetainTheirSerializationOwner() throws Exception {
+        serializationFixture();
+        javaSource("fixture/Outer.java",
+                "package fixture; public class Outer<T> {public class Inner<U> {}"
+                + "public class Middle<M> {public class Deep<N> {}}"
+                + "public class EmptyMiddle {public class Deep<N> {}}"
+                + "public static Object value() {return new Outer<String>().new Inner<Integer>();}"
+                + "public static Object deepValue() {return new Outer<String>().new Middle<Long>().new Deep<Integer>();}"
+                + "public static Object emptyValue() {return new Outer<String>().new EmptyMiddle().new Deep<Integer>();} }");
+        javaSource("fixture/OwnedType.java",
+                "package fixture; import com.alibaba.android.arouter.facade.annotation.Autowired;"
+                + "public class OwnedType extends android.app.Activity {"
+                + "@Autowired public Outer<String>.Inner<Integer> value;"
+                + "@Autowired public Outer<String>.Middle<Long>.Deep<Integer> deep;"
+                + "@Autowired public Outer<String>.EmptyMiddle.Deep<Integer> empty; }");
+        succeed(ksp(model, options("owners"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Object target = loader.loadClass("fixture.OwnedType").getConstructor().newInstance();
+            Object serializer = serializer(loader);
+            Map<String, String> factories = new LinkedHashMap<>();
+            factories.put("value", "value");
+            factories.put("deep", "deepValue");
+            factories.put("empty", "emptyValue");
+            for (Map.Entry<String, String> entry : factories.entrySet()) {
+                Object parsed = loader.loadClass("fixture.Outer").getMethod(entry.getValue()).invoke(null);
+                serializer.getClass().getField("value").set(serializer, parsed);
+                Object bundle = bundle(loader);
+                put(bundle, entry.getKey(), "json");
+                setExtras(loader, target, bundle);
+                inject(loader, target);
+                assertTrue(entry.getKey(), parsed == field(target, entry.getKey()));
+                java.lang.reflect.ParameterizedType declared =
+                        (java.lang.reflect.ParameterizedType) target.getClass().getField(entry.getKey()).getGenericType();
+                java.lang.reflect.ParameterizedType captured =
+                        (java.lang.reflect.ParameterizedType) field(serializer, "lastType");
+                assertEquals(entry.getKey(), declared, captured);
+                assertEquals(entry.getKey(), declared.getOwnerType(), captured.getOwnerType());
+            }
+        }
+    }
+
+    @Test
+    public void kotlinLateinitSetterVisibilityMatchesJvmBackingFieldAccess() throws Exception {
+        String prefix = "package fixture\n"
+                + "class SetterFields : android.app.Activity() {\n"
+                + " @field:com.alibaba.android.arouter.facade.annotation.Autowired\n";
+        for (String declaration : Arrays.asList(
+                " @JvmField val value: String = \"fixed\"\n",
+                " lateinit var value: String\n  private set\n")) {
+            resetOutputs();
+            kotlinSource("fixture/SetterFields.kt", prefix + declaration + "}\n");
+            Result result = ksp(model, options("setters"), false);
+            fails(result, "value");
+            assertNoRegistry();
+        }
+        resetOutputs();
+        kotlinSource("fixture/SetterFields.kt",
+                prefix + " lateinit var value: String\n  protected set\n}\n");
+        succeed(ksp(model, options("setters"), false));
+        try (URLClassLoader loader = compileConsumer(model)) {
+            Object target = loader.loadClass("fixture.SetterFields").getConstructor().newInstance();
+            inject(loader, target);
+            assertEquals(null, field(target, "value"));
+            Object bundle = bundle(loader);
+            put(bundle, "value", "ready");
+            setExtras(loader, target, bundle);
+            inject(loader, target);
+            assertEquals("ready", target.getClass().getMethod("getValue").invoke(target));
+        }
+    }
+
+    @Test
     public void requiredValuesLogAndPrimitiveBundleGettersKeepTheirDefaults() throws Exception {
         javaSource("fixture/Primitives.java",
                 "package fixture; import com.alibaba.android.arouter.facade.annotation.Autowired;"

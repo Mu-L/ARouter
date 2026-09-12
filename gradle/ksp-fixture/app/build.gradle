@@ -1,6 +1,9 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 apply plugin: 'com.android.application'
+if (!rootProject.fixtureBuiltInKotlin) {
+    apply plugin: 'org.jetbrains.kotlin.android'
+}
 apply plugin: 'com.google.devtools.ksp'
 apply plugin: 'com.alibaba.arouter'
 

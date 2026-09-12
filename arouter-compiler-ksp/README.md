@@ -16,23 +16,34 @@ Kotlin 注入支持可写的 `@JvmField` 和可访问的 `lateinit` 字段；普
 
 ## Build and use locally
 
-The checked-in consumer fixture pins:
+The standalone compiler build uses Gradle 9.5.0. Consumer verification selects
+a separate wrapper for each exact Android toolchain:
+
+| AGP | Consumer Gradle | Kotlin integration | Device matrix |
+| --- | --- | --- | --- |
+| 8.12.0 | 8.13 | kotlin-android / kotlin-kapt | API 34 |
+| 9.0.0 | 9.1.0 | built-in Kotlin / legacy-kapt | API 34 |
+| 9.3.2 | 9.5.0 | built-in Kotlin / legacy-kapt | API 21 and 34 |
+
+All rows share:
 
 | Component | Version |
 | --- | --- |
 | Build JDK | 17 |
-| Gradle | 9.5.0 |
 | KSP | 2.3.12 |
 | Kotlin | 2.3.20 |
-| Android Gradle Plugin | 9.3.2 |
 | Consumer compile SDK / build tools | 36 / 36.0.0 |
 | Consumer min SDK | 21 |
 | Compiler and generated Java bytecode | Java 8 |
 
 KSP 2.3.12 requires AGP 8.12.0 or newer according to its
 [release notes](https://github.com/google/ksp/releases/tag/2.3.12).
-This milestone's Android acceptance fixture tests the exact combination above;
-it does not establish compatibility with every intervening AGP/Kotlin version.
+The Gradle minimums come from the official [AGP 8.12](https://developer.android.com/build/releases/agp-8-12-0-release-notes)
+and [AGP 9.0](https://developer.android.com/build/releases/agp-9-0-0-release-notes)
+requirements. Kotlin 2.3.20's [fully supported KGP range](https://kotlinlang.org/docs/gradle-configure-project.html)
+ends at AGP 9.0.0 / Gradle 9.3.0. The 9.3.2 / 9.5.0 row is an additional
+project-tested integration, not a claim of vendor certification.
+The fixture verifies exact rows, not every intervening AGP/Kotlin version.
 The runtime library's minimum Android API is unchanged; the fixture is not a
 minimum-API certification.
 
@@ -158,16 +169,31 @@ Kotlin against this checkout's real annotation model and runtime interfaces, and
 loads route tables. Its Android classes are analysis stubs; it does not replace
 device tests. It covers mixed languages, nested/generic providers, type aliases,
 metadata, diagnostics, generated/deferred injection targets, concrete type tokens,
-interceptor ordering and precompiled field metadata. Logs and generated sources are retained under
+interceptor ordering and precompiled field metadata. Wildcards, stars, raw types,
+generic owners, arrays and Kotlin wildcard annotations are checked against the
+compiled target field's actual JVM reflection type. Logs and generated sources are retained under
 `arouter-compiler-ksp/build/reports/ksp-jvm`.
 
 With JDK 17 and Android SDK 36 configured, run the independent Android consumer:
 
     ./gradle/verify-ksp.sh
 
-With exactly one booted emulator (the CI job uses API 34):
+Select a matrix row with AROUTER_AGP_VERSION; the script chooses and checks its
+matching Gradle wrapper. With exactly one booted API 34 emulator:
 
-    AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+    AROUTER_AGP_VERSION=8.12.0 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+    AROUTER_AGP_VERSION=9.0.0 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+    AROUTER_AGP_VERSION=9.3.2 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+
+For the current integration row on an API 21 emulator:
+
+    AROUTER_EXPECT_API=21 AROUTER_RUN_DEVICE_TESTS=true ./gradle/verify-ksp.sh
+
+The default row is AGP 9.3.2 and the default expected device API is 34.
+An emulator with a different API fails the preflight instead of silently
+substituting another device row. Each retained run includes gradle-version.log,
+toolchain.json (observed AGP/KGP/KSP/JDK and applied plugins), and
+matrix.properties (selected row and actual device API).
 
 The verifier stages the current KSP compiler, checks Debug and Release/R8
 assembly, configuration-cache reuse, incremental source changes, generated
@@ -178,5 +204,5 @@ injection and inherited/nested helpers. It uses runtime consumer rules without
 test-only keep rules. Isolated fixture copies and reports are preserved under
 `build/reports/ksp-consumer`.
 
-Further validation covers additional consumer toolchains and a measured KAPT/KSP
-build comparison. Release coordinates and remote publication are separate.
+A measured KAPT/KSP build comparison is separate from these correctness checks.
+Release coordinates and remote publication are also separate.

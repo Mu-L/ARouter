@@ -5,6 +5,22 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 local_repository="${repo_root}/build/localMaven"
 run_device_tests="${AROUTER_RUN_DEVICE_TESTS:-false}"
+agp_version="${AROUTER_AGP_VERSION:-9.3.2}"
+case "${agp_version}" in
+    8.12.0)
+        gradle_version=8.13
+        wrapper_properties="${script_dir}/ksp-fixture/gradle-wrapper-8.13.properties"
+        ;;
+    9.0.0)
+        gradle_version=9.1.0
+        wrapper_properties="${script_dir}/ksp-fixture/gradle-wrapper-9.1.properties"
+        ;;
+    9.3.2)
+        gradle_version=9.5.0
+        wrapper_properties="${repo_root}/arouter-compiler-ksp/gradle/wrapper/gradle-wrapper.properties"
+        ;;
+    *) echo "Unsupported KSP matrix AGP version: ${agp_version}" >&2; exit 1 ;;
+esac
 case "${run_device_tests}" in
     true|false) ;;
     *) echo "AROUTER_RUN_DEVICE_TESTS must be true or false." >&2; exit 1 ;;
@@ -64,8 +80,10 @@ if [[ "${run_device_tests}" == true ]]; then
         exit 1
     fi
     api_level="$("${adb}" shell getprop ro.build.version.sdk | tr -d '\r')"
-    if [[ ! "${api_level}" =~ ^[0-9]+$ || "${api_level}" -lt 21 ]]; then
-        echo "The KSP consumer fixture requires an API 21 or newer emulator." >&2
+    expected_api="${AROUTER_EXPECT_API:-34}"
+    if [[ ! "${expected_api}" =~ ^[0-9]+$ || "${expected_api}" -lt 21 \
+            || "${api_level}" != "${expected_api}" ]]; then
+        echo "KSP consumer expected API ${expected_api}, found API ${api_level}." >&2
         exit 1
     fi
 fi
@@ -78,13 +96,29 @@ trap 'echo "Preserved KSP verification artifacts at ${test_root}."' EXIT
 project_dir="${test_root}/project"
 mkdir -p "${project_dir}"
 rsync -a --exclude '.gradle/' --exclude 'build/' "${script_dir}/ksp-fixture/" "${project_dir}/"
+wrapper_dir="${test_root}/wrapper/gradle/wrapper"
+mkdir -p "${wrapper_dir}"
+cp "${repo_root}/gradle/wrapper/gradle-wrapper.jar" "${wrapper_dir}/gradle-wrapper.jar"
+cp "${wrapper_properties}" "${wrapper_dir}/gradle-wrapper.properties"
+if ! grep -Eq '^distributionSha256Sum=[0-9a-f]{64}$' "${wrapper_dir}/gradle-wrapper.properties"; then
+    echo "The selected KSP matrix wrapper must pin an exact SHA-256 checksum." >&2
+    exit 1
+fi
+wrapper_command=("${java_command}" -Dorg.gradle.appname=gradlew
+    -classpath "${wrapper_dir}/gradle-wrapper.jar" org.gradle.wrapper.GradleWrapperMain)
+"${wrapper_command[@]}" --version 2>&1 | tee "${test_root}/gradle-version.log"
+grep -Fx "Gradle ${gradle_version}" "${test_root}/gradle-version.log"
+printf 'agp=%s\ngradle=%s\nexpected_api=%s\nactual_api=%s\nserial=%s\n' \
+    "${agp_version}" "${gradle_version}" "${expected_api:-not-requested}" \
+    "${api_level:-not-requested}" "${serial:-not-requested}" > "${test_root}/matrix.properties"
 
 compiler_command=("${repo_root}/arouter-compiler-ksp/gradlew"
     -p "${repo_root}/arouter-compiler-ksp" --no-daemon --console=plain --stacktrace)
-fixture_command=("${repo_root}/arouter-compiler-ksp/gradlew"
+fixture_command=("${wrapper_command[@]}"
     -p "${project_dir}" --no-daemon --console=plain --stacktrace
     --configuration-cache --configuration-cache-problems=fail
     "-Parouter.repository=${local_repository}"
+    "-Parouter.agp.version=${agp_version}"
     "-Parouter.api.version=${api_version}"
     "-Parouter.compiler.version=${compiler_version}"
     "-Parouter.register.version=${register_version}"
@@ -96,10 +130,31 @@ fi
 
 # Rebuild the processor before consumption: an existing local snapshot is not
 # evidence that the checked-out processor generated the application routes.
-"${compiler_command[@]}" test installLocally | tee "${test_root}/compiler.log"
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/first-build.log"
+"${compiler_command[@]}" test installLocally 2>&1 | tee "${test_root}/compiler.log"
+# Preserve the exact inputs before any consumer build. A later compiler edit
+# must never cause an earlier matrix row to be attributed to the newer source.
+input_artifacts="${test_root}/input-artifacts"
+mkdir -p "${input_artifacts}"
+cp "${repo_root}/arouter-compiler-ksp/build/libs/arouter-compiler-ksp-${ksp_compiler_version}.jar" \
+    "${input_artifacts}/arouter-compiler-ksp.jar"
+cp "${repo_root}/arouter-compiler-ksp/build/libs/arouter-compiler-ksp-${ksp_compiler_version}-sources.jar" \
+    "${input_artifacts}/arouter-compiler-ksp-sources.jar"
+cp "${local_repository}/com/alibaba/arouter-api/${api_version}/arouter-api-${api_version}.aar" \
+    "${input_artifacts}/arouter-api.aar"
+cp "${local_repository}/com/alibaba/arouter-annotation/${annotation_version}/arouter-annotation-${annotation_version}.jar" \
+    "${input_artifacts}/arouter-annotation.jar"
+cp "${local_repository}/com/alibaba/arouter-compiler/${compiler_version}/arouter-compiler-${compiler_version}.jar" \
+    "${input_artifacts}/arouter-compiler.jar"
+cp "${local_repository}/com/alibaba/arouter-register/${register_version}/arouter-register-${register_version}.jar" \
+    "${input_artifacts}/arouter-register.jar"
+cp "${repo_root}/arouter-compiler-ksp/build/publications/mavenJava/pom-default.xml" \
+    "${input_artifacts}/arouter-compiler-ksp.pom"
+shasum -a 256 "${input_artifacts}"/* > "${test_root}/input-artifacts.sha256"
+"${fixture_command[@]}" verifyToolchain 2>&1 | tee "${test_root}/toolchain.log"
+cp "${project_dir}/build/reports/toolchain.json" "${test_root}/toolchain.json"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/first-build.log"
 grep -F 'Configuration cache entry stored.' "${test_root}/first-build.log"
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/second-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/second-build.log"
 grep -F 'Configuration cache entry reused.' "${test_root}/second-build.log"
 
 verify_registrations() {
@@ -147,7 +202,7 @@ verify_registrations release
 perl -pi -e 's#/ksp/java"#/ksp/java-updated"#g' \
     "${project_dir}/app/src/main/java/com/alibaba/android/arouter/kspfixture/JavaActivity.java" \
     "${project_dir}/app/src/main/java/com/alibaba/android/arouter/kspfixture/ProbeActivity.java"
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/incremental-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/incremental-build.log"
 grep -F 'Configuration cache entry reused.' "${test_root}/incremental-build.log"
 for variant in debug release; do
     generated_group="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes/ARouter\$\$Group\$\$ksp.java"
@@ -171,7 +226,7 @@ package com.alibaba.android.arouter.kspfixture
 @com.alibaba.android.arouter.facade.annotation.Route(path = "/addition/fragment")
 class AddedFragment : androidx.fragment.app.Fragment()
 KOTLIN
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/added-route-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/added-route-build.log"
 grep -F 'Configuration cache entry reused.' "${test_root}/added-route-build.log"
 for variant in debug release; do
     generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
@@ -179,7 +234,7 @@ for variant in debug release; do
     grep -F '"addition"' "${generated_dir}/ARouter\$\$Root\$\$kspapp.java"
 done
 mv "${added_source}" "${test_root}/removed-AddedFragment.kt"
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/removed-route-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/removed-route-build.log"
 grep -F 'Configuration cache entry reused.' "${test_root}/removed-route-build.log"
 for variant in debug release; do
     generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
@@ -210,7 +265,7 @@ if [[ "${annotation_count}" != 7 ]]; then
     echo "Expected to remove all seven KSP fixture route annotations, found ${annotation_count}." >&2
     exit 1
 fi
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/empty-module-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/empty-module-build.log"
 grep -F 'Configuration cache entry reused.' "${test_root}/empty-module-build.log"
 for variant in debug release; do
     generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
@@ -233,7 +288,7 @@ rsync -a "${saved_sources}/" "${project_dir}/"
 while IFS= read -r -d '' saved_source; do
     cmp "${saved_source}" "${project_dir}/${saved_source#${saved_sources}/}"
 done < <(find "${saved_sources}" -type f -print0)
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/restored-routes-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/restored-routes-build.log"
 grep -F 'Configuration cache entry reused.' "${test_root}/restored-routes-build.log"
 for variant in debug release; do
     generated_dir="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes"
@@ -252,12 +307,12 @@ public final class IncrementalTarget {
     @com.alibaba.android.arouter.facade.annotation.Autowired public KspService provider;
 }
 JAVA
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/added-helper-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/added-helper-build.log"
 for variant in debug release; do
     test -s "${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/kspfixture/IncrementalTarget\$\$ARouter\$\$Autowired.java"
 done
 mv "${injected_source}" "${test_root}/removed-IncrementalTarget.java"
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/removed-helper-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/removed-helper-build.log"
 for variant in debug release; do
     if find "${project_dir}/app/build/generated/ksp/${variant}" -type f \
             -name 'IncrementalTarget$$ARouter$$Autowired.java' | grep . >/dev/null; then
@@ -290,7 +345,7 @@ if [[ "${interceptor_count}" != 2 ]]; then
     echo "Expected two KSP interceptors, found ${interceptor_count}." >&2
     exit 1
 fi
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/empty-interceptors-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/empty-interceptors-build.log"
 for variant in debug release; do
     registry="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes/ARouter\$\$Interceptors\$\$kspapp.java"
     test -s "${registry}"
@@ -303,7 +358,7 @@ rsync -a "${saved_interceptors}/" "${project_dir}/"
 while IFS= read -r -d '' saved_source; do
     cmp "${saved_source}" "${project_dir}/${saved_source#${saved_interceptors}/}"
 done < <(find "${saved_interceptors}" -type f -print0)
-"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease | tee "${test_root}/restored-interceptors-build.log"
+"${fixture_command[@]}" :app:assembleDebug :app:assembleRelease 2>&1 | tee "${test_root}/restored-interceptors-build.log"
 for variant in debug release; do
     registry="${project_dir}/app/build/generated/ksp/${variant}/java/com/alibaba/android/arouter/routes/ARouter\$\$Interceptors\$\$kspapp.java"
     grep -F 'interceptors.put(-10,' "${registry}"
@@ -311,7 +366,7 @@ for variant in debug release; do
     verify_registrations "${variant}"
 done
 
-"${fixture_command[@]}" :app:dependencies --configuration debugRuntimeClasspath |
+"${fixture_command[@]}" :app:dependencies --configuration debugRuntimeClasspath 2>&1 |
     tee "${test_root}/runtime-dependencies.log"
 if grep -E 'com.google.devtools.ksp:|com.alibaba:arouter-compiler|com.squareup:javapoet|com.google.code.gson:gson' \
         "${test_root}/runtime-dependencies.log"; then
@@ -324,7 +379,7 @@ if [[ "${run_device_tests}" == true ]]; then
         if [[ "${test_type}" == debug ]]; then test_variant=Debug; else test_variant=Release; fi
         marker="$(mktemp "${test_root}/device-${test_type}.XXXXXX")"
         "${fixture_command[@]}" --no-configuration-cache \
-            "-Parouter.test.build.type=${test_type}" ":app:connected${test_variant}AndroidTest" |
+            "-Parouter.test.build.type=${test_type}" ":app:connected${test_variant}AndroidTest" 2>&1 |
             tee "${test_root}/device-${test_type}.log"
         report_count=0
         while IFS= read -r -d '' report; do
@@ -343,4 +398,4 @@ if [[ "${run_device_tests}" == true ]]; then
     done
 fi
 
-echo 'KSP 2.3.12 / Kotlin 2.3.20 / AGP 9.3.2 consumer verification passed.'
+echo "KSP 2.3.12 / Kotlin 2.3.20 / AGP ${agp_version} / Gradle ${gradle_version} consumer verification passed."

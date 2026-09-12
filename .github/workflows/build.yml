@@ -306,9 +306,26 @@ jobs:
             ${{ runner.temp }}/arouter-gradle-plugin.*/project/app/build/outputs/mapping/
 
   ksp-consumer:
-    name: KSP2 compiler and Android consumer (API 34 / Debug and R8)
+    name: KSP2 consumer (AGP ${{ matrix.agp }} / Gradle ${{ matrix.gradle }} / API ${{ matrix.api }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agp: 8.12.0
+            gradle: '8.13'
+            api: 34
+          - agp: 9.0.0
+            gradle: '9.1.0'
+            api: 34
+          - agp: 9.3.2
+            gradle: '9.5.0'
+            api: 34
+          - agp: 9.3.2
+            gradle: '9.5.0'
+            api: 21
 
     steps:
       - name: Checkout
@@ -352,12 +369,14 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Verify KSP processing and mixed APT/KSP Android routing
+      - name: Verify KSP processing and mixed KAPT/KSP Android routing
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         env:
+          AROUTER_AGP_VERSION: ${{ matrix.agp }}
+          AROUTER_EXPECT_API: ${{ matrix.api }}
           AROUTER_RUN_DEVICE_TESTS: 'true'
         with:
-          api-level: 34
+          api-level: ${{ matrix.api }}
           arch: x86_64
           target: default
           disable-animations: true
@@ -367,12 +386,16 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ksp2-consumer-api34
+          name: ksp2-consumer-agp-${{ matrix.agp }}-api${{ matrix.api }}
           retention-days: 14
           path: |
             arouter-compiler-ksp/build/reports/tests/
             arouter-compiler-ksp/build/test-results/
             build/reports/ksp-consumer/run.*/*.log
+            build/reports/ksp-consumer/run.*/*.json
+            build/reports/ksp-consumer/run.*/*.properties
+            build/reports/ksp-consumer/run.*/*.sha256
+            build/reports/ksp-consumer/run.*/input-artifacts/
             build/reports/ksp-consumer/run.*/project/app/build/reports/androidTests/
             build/reports/ksp-consumer/run.*/project/app/build/outputs/androidTest-results/
             build/reports/ksp-consumer/run.*/project/app/build/outputs/mapping/

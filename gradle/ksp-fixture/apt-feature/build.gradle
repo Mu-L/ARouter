@@ -1,5 +1,10 @@
 apply plugin: 'com.android.library'
-apply plugin: 'com.android.legacy-kapt'
+if (rootProject.fixtureBuiltInKotlin) {
+    apply plugin: 'com.android.legacy-kapt'
+} else {
+    apply plugin: 'org.jetbrains.kotlin.android'
+    apply plugin: 'org.jetbrains.kotlin.kapt'
+}
 
 android {
     namespace 'com.alibaba.android.arouter.kspfixture.legacy'
@@ -19,8 +24,13 @@ kapt {
     includeCompileClasspath = false
 }
 
+kotlin {
+    compilerOptions { jvmTarget = JvmTarget.JVM_1_8 }
+}
+
 dependencies {
     api "com.alibaba:arouter-api:${rootProject.property('arouter.api.version')}"
     api 'androidx.fragment:fragment:1.0.0'
     kapt "com.alibaba:arouter-compiler:${rootProject.property('arouter.compiler.version')}"
 }
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
